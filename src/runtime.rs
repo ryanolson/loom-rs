@@ -191,14 +191,14 @@ impl Drop for ComputeTaskGuard {
 /// runtime.block_until_idle();
 /// ```
 pub struct LoomRuntime {
-    inner: Arc<LoomRuntimeInner>,
+    pub(crate) inner: Arc<LoomRuntimeInner>,
 }
 
 /// Inner state shared with thread-locals.
 ///
 /// This is Arc-wrapped and shared with tokio/rayon worker threads via thread-local
 /// storage, enabling `current_runtime()` to work from any managed thread.
-pub struct LoomRuntimeInner {
+pub(crate) struct LoomRuntimeInner {
     config: LoomConfig,
     tokio_runtime: tokio::runtime::Runtime,
     pub(crate) rayon_pool: rayon::ThreadPool,
@@ -226,6 +226,13 @@ pub struct LoomRuntimeInner {
 }
 
 impl LoomRuntime {
+    /// Create a LoomRuntime from an existing inner reference.
+    ///
+    /// Used by `current_runtime()` to wrap the thread-local inner.
+    pub(crate) fn from_inner(inner: Arc<LoomRuntimeInner>) -> Self {
+        Self { inner }
+    }
+
     /// Create a runtime from a configuration.
     ///
     /// This is typically called via `LoomBuilder::build()`.

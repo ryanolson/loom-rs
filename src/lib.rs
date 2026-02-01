@@ -170,7 +170,7 @@ pub use context::current_runtime;
 pub use error::{LoomError, Result};
 pub use mab::{ComputeHint, ComputeHintProvider, MabKnobs, MabScheduler};
 pub use metrics::LoomMetrics;
-pub use runtime::{LoomRuntime, LoomRuntimeInner};
+pub use runtime::LoomRuntime;
 pub use stream::ComputeStreamExt;
 
 /// Spawn compute work using the current runtime.

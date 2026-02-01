@@ -256,11 +256,11 @@ where
         // Initialize state on first poll
         let state = this.state.get_or_insert_with(|| {
             let runtime = current_runtime().expect("compute_map used outside loom runtime");
-            let pool = runtime.pools.get_or_create::<U>();
+            let pool = runtime.inner.pools.get_or_create::<U>();
             let task_state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
             ComputeMapState {
-                runtime,
+                runtime: runtime.inner,
                 pool,
                 task_state,
                 pending: None,
@@ -427,14 +427,14 @@ where
         // Initialize state on first poll
         let state = this.state.get_or_insert_with(|| {
             let runtime = current_runtime().expect("adaptive_map used outside loom runtime");
-            let pool = runtime.pools.get_or_create::<U>();
+            let pool = runtime.inner.pools.get_or_create::<U>();
             let task_state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
             // Create a per-stream scheduler with runtime's configured knobs
-            let scheduler = MabScheduler::new(runtime.mab_knobs.clone());
+            let scheduler = MabScheduler::new(runtime.inner.mab_knobs.clone());
 
             AdaptiveMapState {
-                runtime,
+                runtime: runtime.inner,
                 pool,
                 task_state,
                 scheduler,
