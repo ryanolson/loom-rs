@@ -128,6 +128,62 @@ pub fn parse_and_validate_cpuset(s: &str) -> Result<Vec<usize>> {
     Ok(cpus)
 }
 
+/// Format a slice of CPU IDs into a compact cpuset string.
+///
+/// This is the inverse of `parse_cpuset`. Consecutive CPU IDs are
+/// collapsed into ranges.
+///
+/// # Examples
+///
+/// ```
+/// use loom_rs::cpuset::format_cpuset;
+///
+/// assert_eq!(format_cpuset(&[0, 1, 2, 3]), "0-3");
+/// assert_eq!(format_cpuset(&[0, 1, 2, 5, 6, 7]), "0-2,5-7");
+/// assert_eq!(format_cpuset(&[0, 2, 4]), "0,2,4");
+/// assert_eq!(format_cpuset(&[]), "");
+/// ```
+pub fn format_cpuset(cpus: &[usize]) -> String {
+    if cpus.is_empty() {
+        return String::new();
+    }
+
+    // Sort and deduplicate
+    let mut sorted: Vec<usize> = cpus.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut result = String::new();
+    let mut i = 0;
+
+    while i < sorted.len() {
+        let start = sorted[i];
+        let mut end = start;
+
+        // Find the end of this consecutive range
+        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
+            i += 1;
+            end = sorted[i];
+        }
+
+        // Append separator if needed
+        if !result.is_empty() {
+            result.push(',');
+        }
+
+        // Format as range or single value
+        if start == end {
+            result.push_str(&start.to_string());
+        } else {
+            result.push_str(&format!("{}-{}", start, end));
+        }
+
+        i += 1;
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +268,57 @@ mod tests {
         assert!(validate_cpuset(&available).is_ok());
         // Validating a very high CPU number should fail
         assert!(validate_cpuset(&[99999]).is_err());
+    }
+
+    #[test]
+    fn test_format_cpuset_empty() {
+        assert_eq!(format_cpuset(&[]), "");
+    }
+
+    #[test]
+    fn test_format_cpuset_single() {
+        assert_eq!(format_cpuset(&[0]), "0");
+        assert_eq!(format_cpuset(&[5]), "5");
+    }
+
+    #[test]
+    fn test_format_cpuset_range() {
+        assert_eq!(format_cpuset(&[0, 1, 2, 3]), "0-3");
+        assert_eq!(format_cpuset(&[8, 9, 10, 11]), "8-11");
+    }
+
+    #[test]
+    fn test_format_cpuset_mixed() {
+        assert_eq!(format_cpuset(&[0, 1, 2, 3, 8, 9, 10, 11]), "0-3,8-11");
+        assert_eq!(format_cpuset(&[0, 2, 4, 6]), "0,2,4,6");
+        assert_eq!(format_cpuset(&[0, 2, 3, 4, 8]), "0,2-4,8");
+    }
+
+    #[test]
+    fn test_format_cpuset_unsorted() {
+        // Should handle unsorted input
+        assert_eq!(format_cpuset(&[3, 1, 2, 0]), "0-3");
+        assert_eq!(format_cpuset(&[8, 9, 10, 11, 0, 1, 2, 3]), "0-3,8-11");
+    }
+
+    #[test]
+    fn test_format_cpuset_duplicates() {
+        // Should handle duplicates
+        assert_eq!(format_cpuset(&[0, 0, 1, 1, 2]), "0-2");
+    }
+
+    #[test]
+    fn test_format_parse_roundtrip() {
+        // format -> parse should be identity
+        let cases = vec![
+            vec![0, 1, 2, 3],
+            vec![0, 2, 4, 6],
+            vec![0, 1, 2, 5, 6, 7, 10],
+        ];
+        for cpus in cases {
+            let formatted = format_cpuset(&cpus);
+            let parsed = parse_cpuset(&formatted).unwrap();
+            assert_eq!(parsed, cpus);
+        }
     }
 }

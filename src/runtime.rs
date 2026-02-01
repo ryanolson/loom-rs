@@ -32,7 +32,7 @@ use crate::affinity::{pin_to_cpu, CpuAllocator};
 use crate::bridge::{PooledRayonTask, TaskState};
 use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
-use crate::cpuset::{available_cpus, parse_and_validate_cpuset};
+use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
 use crate::error::{LoomError, Result};
 use crate::pool::ComputePoolRegistry;
 
@@ -164,6 +164,14 @@ pub struct LoomRuntimeInner {
     compute_state: ComputeTaskState,
     /// Per-type object pools for zero-allocation spawn_compute
     pools: ComputePoolRegistry,
+    /// Number of tokio worker threads
+    tokio_threads: usize,
+    /// Number of rayon worker threads
+    rayon_threads: usize,
+    /// CPUs allocated to tokio workers
+    tokio_cpus: Vec<usize>,
+    /// CPUs allocated to rayon workers
+    rayon_cpus: Vec<usize>,
 }
 
 impl LoomRuntime {
@@ -231,11 +239,11 @@ impl LoomRuntime {
 
             // Build tokio runtime with thread-local injection
             let tokio_runtime =
-                Self::build_tokio_runtime(&prefix, tokio_threads, tokio_cpus, weak_clone.clone())
+                Self::build_tokio_runtime(&prefix, tokio_threads, tokio_cpus.clone(), weak_clone.clone())
                     .expect("failed to build tokio runtime");
 
             // Build rayon pool with thread-local injection
-            let rayon_pool = Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus, weak_clone)
+            let rayon_pool = Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus.clone(), weak_clone)
                 .expect("failed to build rayon pool");
 
             LoomRuntimeInner {
@@ -245,6 +253,10 @@ impl LoomRuntime {
                 task_tracker: TaskTracker::new(),
                 compute_state: ComputeTaskState::new(),
                 pools: ComputePoolRegistry::new(pool_size),
+                tokio_threads,
+                rayon_threads,
+                tokio_cpus,
+                rayon_cpus,
             }
         });
 
@@ -638,6 +650,20 @@ impl std::fmt::Debug for LoomRuntime {
     }
 }
 
+impl std::fmt::Display for LoomRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoomRuntime[{}]: tokio({}, cpus={}) rayon({}, cpus={})",
+            self.inner.config.prefix,
+            self.inner.tokio_threads,
+            format_cpuset(&self.inner.tokio_cpus),
+            self.inner.rayon_threads,
+            format_cpuset(&self.inner.rayon_cpus),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,5 +853,16 @@ mod tests {
             runtime.spawn_compute(|| 42).await;
         });
         assert_eq!(runtime.compute_tasks_in_flight(), 0);
+    }
+
+    #[test]
+    fn test_display() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let display = format!("{}", runtime);
+        assert!(display.starts_with("LoomRuntime[test]:"));
+        assert!(display.contains("tokio(1, cpus="));
+        assert!(display.contains("rayon(1, cpus="));
     }
 }
