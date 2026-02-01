@@ -607,8 +607,12 @@ impl LoomRuntimeInner {
         let guard = ComputeTaskGuard::new(&self.compute_state);
 
         self.rayon_pool.spawn(move || {
-            let _guard = guard; // Moved here, drops at end (panic-safe)
-            let result = f();
+            // Execute work inside guard scope so counter decrements BEFORE completing.
+            // This ensures the async future sees count=0 when it wakes up.
+            let result = {
+                let _guard = guard;
+                f()
+            };
             completion.complete(result);
         });
 
