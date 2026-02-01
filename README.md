@@ -189,6 +189,7 @@ Threads are named with the configured prefix:
 |--------|----------|----------|---------|
 | `spawn_async()` | I/O-bound async tasks | ~10ns | Yes |
 | `spawn_compute()` | CPU-bound work (await from async) | ~100-500ns | Yes |
+| `compute_map()` | Stream items -> rayon -> stream | ~100-500ns/item | No |
 | `install()` | Zero-overhead parallel iterators | ~0ns | No |
 
 ### Shutdown
@@ -246,6 +247,37 @@ runtime.block_on(async {
     rt.spawn_async(async { /* ... */ });
 });
 ```
+
+## Stream Processing
+
+Use `ComputeStreamExt` to process async stream items on rayon:
+
+```rust
+use loom_rs::{LoomBuilder, ComputeStreamExt};
+use futures::stream::{self, StreamExt};
+
+let runtime = LoomBuilder::new().build()?;
+
+runtime.block_on(async {
+    let numbers = stream::iter(0..100);
+
+    // Each item is processed on rayon, results stream back
+    let results: Vec<_> = numbers
+        .compute_map(|n| {
+            // CPU-intensive work runs on rayon
+            (0..n).map(|i| i * i).sum::<i64>()
+        })
+        .collect()
+        .await;
+});
+```
+
+This is ideal for pipelines where you:
+1. Await values from an async source (network, channel, file)
+2. Process each value with CPU-intensive work
+3. Continue the async pipeline with the results
+
+Items are processed sequentially to preserve ordering and provide natural backpressure.
 
 ## Performance
 
@@ -341,6 +373,22 @@ runtime.spawn_async(async {
 runtime.spawn_async(async {
     runtime.spawn_compute(|| heavy_par_iter()).await;
 }).await;
+```
+
+### 6. Manual spawn_compute Loop on Streams
+
+```rust
+// WORKS but slower: Pool get/return for each item
+while let Some(item) = stream.next().await {
+    let result = runtime.spawn_compute(|| process(item)).await;
+    results.push(result);
+}
+
+// BETTER: compute_map reuses internal state
+let results: Vec<_> = stream
+    .compute_map(|item| process(item))
+    .collect()
+    .await;
 ```
 
 ## License

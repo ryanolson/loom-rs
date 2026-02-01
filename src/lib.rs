@@ -148,8 +148,8 @@
 //! - Tokio threads: `{prefix}-tokio-0000`, `{prefix}-tokio-0001`, ...
 //! - Rayon threads: `{prefix}-rayon-0000`, `{prefix}-rayon-0001`, ...
 
-pub mod affinity;
-pub mod bridge;
+pub(crate) mod affinity;
+pub(crate) mod bridge;
 pub mod builder;
 pub mod config;
 pub(crate) mod context;
@@ -157,6 +157,7 @@ pub mod cpuset;
 pub mod error;
 pub(crate) mod pool;
 pub mod runtime;
+pub mod stream;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -166,6 +167,7 @@ pub use config::LoomConfig;
 pub use context::current_runtime;
 pub use error::{LoomError, Result};
 pub use runtime::{LoomRuntime, LoomRuntimeInner};
+pub use stream::ComputeStreamExt;
 
 /// Spawn compute work using the current runtime.
 ///

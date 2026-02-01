@@ -11,6 +11,8 @@
 //! - Uses `diatomic-waker` for efficient cross-thread waking
 //! - Uses `parking_lot::Mutex` for lower-overhead locking
 
+#![allow(dead_code)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

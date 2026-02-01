@@ -158,12 +158,12 @@ pub struct LoomRuntime {
 pub struct LoomRuntimeInner {
     config: LoomConfig,
     tokio_runtime: tokio::runtime::Runtime,
-    rayon_pool: rayon::ThreadPool,
+    pub(crate) rayon_pool: rayon::ThreadPool,
     task_tracker: TaskTracker,
     /// Track in-flight rayon tasks for graceful shutdown
     compute_state: ComputeTaskState,
     /// Per-type object pools for zero-allocation spawn_compute
-    pools: ComputePoolRegistry,
+    pub(crate) pools: ComputePoolRegistry,
     /// Number of tokio worker threads
     tokio_threads: usize,
     /// Number of rayon worker threads

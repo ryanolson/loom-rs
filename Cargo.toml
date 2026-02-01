@@ -1,6 +1,6 @@
 [package]
 name = "loom-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Weaving threads together - A bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities"
 license = "MIT"
@@ -21,6 +21,8 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 core_affinity = "0.8"
 tracing = "0.1"
+futures-core = "0.3"
+pin-project-lite = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hwlocality = { version = "1.0.0-alpha.11", optional = true }

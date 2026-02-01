@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "loom-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "core_affinity",
@@ -647,9 +647,11 @@ dependencies = [
  "diatomic-waker",
  "figment",
  "futures",
+ "futures-core",
  "hwlocality",
  "nvml-wrapper",
  "parking_lot",
+ "pin-project-lite",
  "rayon",
  "serde",
  "serde_json",
