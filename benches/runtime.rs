@@ -49,8 +49,8 @@ fn large_work() -> u64 {
 fn create_runtime() -> loom_rs::LoomRuntime {
     LoomBuilder::new()
         .prefix("bench")
-        .tokio_threads(2)
-        .rayon_threads(4)
+        .tokio_threads(1)
+        .rayon_threads(2)
         .build()
         .expect("failed to create runtime")
 }
