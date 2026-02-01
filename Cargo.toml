@@ -2,7 +2,7 @@
 name = "loom-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Weaving multiple threads together - A bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities"
+description = "Weaving threads together - A bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities"
 license = "MIT"
 repository = "https://github.com/ryanolson/loom-rs"
 keywords = ["async", "runtime", "threadpool", "cpu-affinity", "tokio"]
@@ -29,6 +29,7 @@ nvml-wrapper = { version = "0.10", optional = true }
 [features]
 default = []
 cuda = ["hwlocality", "nvml-wrapper"]
+cuda-tests = ["cuda"]  # Enable hardware-dependent CUDA tests
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }

@@ -20,8 +20,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install hwloc
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libudev-dev
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets -- -D warnings -A deprecated
       - run: cargo clippy --all-targets --features cuda -- -D warnings -A deprecated

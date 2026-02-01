@@ -18,6 +18,13 @@ Install git hooks to auto-format on commit:
 ./hooks/install.sh
 ```
 
+### System Dependencies (for `cuda` feature)
+
+The `cuda` feature requires hwloc system libraries (Linux only):
+```bash
+sudo apt-get install libhwloc-dev libudev-dev
+```
+
 ## Code Style
 
 - Run `cargo clippy -- -D warnings -A deprecated` before committing
@@ -42,12 +49,12 @@ Install git hooks to auto-format on commit:
 
 - `default` - No optional features
 - `cuda` - Enable CUDA device selection for NUMA-aware CPU pinning (requires hwlocality and nvml-wrapper, Linux only)
+- `cuda-tests` - Enable hardware-dependent CUDA tests (implies `cuda`)
 
 ## Testing
 
 - Unit tests are in each module
-- CUDA tests are marked `#[ignore]` as they require hardware
-- Use `cargo test -- --ignored` to run hardware-dependent tests
+- CUDA hardware tests require the `cuda-tests` feature: `cargo test --features cuda-tests`
 
 ## Performance Guidelines
 

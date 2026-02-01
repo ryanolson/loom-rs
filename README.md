@@ -1,6 +1,6 @@
 # loom-rs
 
-**Weaving multiple threads together**
+**Weaving threads together**
 
 A Rust crate providing a bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities.
 
@@ -151,7 +151,15 @@ The `cpuset` option accepts a string in Linux taskset/numactl format:
 
 ## CUDA Support
 
-With the `cuda` feature enabled (Linux only), configure the runtime to use CPUs local to a specific GPU:
+With the `cuda` feature enabled (Linux only), configure the runtime to use CPUs local to a specific GPU.
+
+### System Dependencies
+
+```bash
+sudo apt-get install libhwloc-dev libudev-dev
+```
+
+### Usage
 
 ```rust
 let runtime = LoomBuilder::new()

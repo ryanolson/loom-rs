@@ -149,22 +149,20 @@ pub fn list_cuda_devices() -> Result<Vec<(u32, String, String)>> {
 mod tests {
     use super::*;
 
-    // Note: These tests require CUDA hardware and NVML to be available.
-    // They are marked as ignored by default.
-
+    #[cfg(feature = "cuda-tests")]
     #[test]
-    #[ignore]
     fn test_list_cuda_devices() {
-        let devices = list_cuda_devices();
-        // May or may not succeed depending on hardware
+        let devices = list_cuda_devices().expect("CUDA devices should be available");
+        assert!(!devices.is_empty(), "At least one CUDA device expected");
         println!("CUDA devices: {:?}", devices);
     }
 
+    #[cfg(feature = "cuda-tests")]
     #[test]
-    #[ignore]
     fn test_cpuset_for_cuda_device() {
-        let cpus = cpuset_for_cuda_device(&CudaDeviceSelector::DeviceId(0));
-        // May or may not succeed depending on hardware
+        let cpus =
+            cpuset_for_cuda_device(&CudaDeviceSelector::DeviceId(0)).expect("Should find CPUs");
+        assert!(!cpus.is_empty(), "Should have CPUs for device 0");
         println!("CPUs for CUDA device 0: {:?}", cpus);
     }
 
