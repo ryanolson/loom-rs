@@ -98,8 +98,8 @@ impl Default for EvaluationConfig {
 
 /// A starvation event detected during evaluation.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct StarvationEvent {
-    #[allow(dead_code)]
     timestamp: Instant,
     config_name: &'static str,
     tokio_threads: usize,
@@ -1153,6 +1153,7 @@ fn compute_verdict(
 // Report Generation
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn print_markdown_report(
     system_info: &SystemInfo,
     eval_config: &EvaluationConfig,

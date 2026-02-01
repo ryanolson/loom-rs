@@ -239,8 +239,10 @@ mod tests {
         // Default uses conservative estimate
         assert!((knobs.offload_overhead_us() - 300.0).abs() < 0.001);
 
-        let mut knobs = MabKnobs::default();
-        knobs.measured_offload_overhead_us = Some(150.0);
+        let knobs = MabKnobs {
+            measured_offload_overhead_us: Some(150.0),
+            ..Default::default()
+        };
         assert!((knobs.offload_overhead_us() - 150.0).abs() < 0.001);
     }
 

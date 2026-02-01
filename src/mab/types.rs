@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn test_primitives_return_unknown() {
         assert_eq!(42i32.compute_hint(), ComputeHint::Unknown);
-        assert_eq!(3.14f64.compute_hint(), ComputeHint::Unknown);
+        assert_eq!(1.234f64.compute_hint(), ComputeHint::Unknown);
         assert_eq!("hello".compute_hint(), ComputeHint::Unknown);
         assert_eq!(String::from("world").compute_hint(), ComputeHint::Unknown);
     }
