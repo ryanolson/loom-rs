@@ -238,13 +238,18 @@ impl LoomRuntime {
             let weak_clone = weak.clone();
 
             // Build tokio runtime with thread-local injection
-            let tokio_runtime =
-                Self::build_tokio_runtime(&prefix, tokio_threads, tokio_cpus.clone(), weak_clone.clone())
-                    .expect("failed to build tokio runtime");
+            let tokio_runtime = Self::build_tokio_runtime(
+                &prefix,
+                tokio_threads,
+                tokio_cpus.clone(),
+                weak_clone.clone(),
+            )
+            .expect("failed to build tokio runtime");
 
             // Build rayon pool with thread-local injection
-            let rayon_pool = Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus.clone(), weak_clone)
-                .expect("failed to build rayon pool");
+            let rayon_pool =
+                Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus.clone(), weak_clone)
+                    .expect("failed to build rayon pool");
 
             LoomRuntimeInner {
                 config,
