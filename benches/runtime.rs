@@ -63,38 +63,22 @@ fn bench_spawn_compute(c: &mut Criterion) {
 
     // Minimal work - shows pure overhead
     group.bench_function("minimal_work", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                runtime.spawn_compute(minimal_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { runtime.spawn_compute(minimal_work).await }));
     });
 
     // Small work (~100ns) - overhead still visible
     group.bench_function("small_work", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                runtime.spawn_compute(small_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { runtime.spawn_compute(small_work).await }));
     });
 
     // Medium work (~1µs) - overhead becoming amortized
     group.bench_function("medium_work", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                runtime.spawn_compute(medium_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { runtime.spawn_compute(medium_work).await }));
     });
 
     // Large work (~10µs) - overhead fully amortized
     group.bench_function("large_work", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                runtime.spawn_compute(large_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { runtime.spawn_compute(large_work).await }));
     });
 
     group.finish();
@@ -155,11 +139,7 @@ fn bench_bridge(c: &mut Criterion) {
 
     // Measure bridge overhead by comparing spawn_compute to direct rayon + block
     group.bench_function("spawn_compute_bridge", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                runtime.spawn_compute(minimal_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { runtime.spawn_compute(minimal_work).await }));
     });
 
     // Direct rayon spawn with manual sync (simulates what tokio-rayon did)
@@ -299,9 +279,7 @@ fn bench_spawn_compute_pooling(c: &mut Criterion) {
                     .expect("failed to create runtime");
 
                 let start = std::time::Instant::now();
-                runtime.block_on(async {
-                    runtime.spawn_compute(minimal_work).await
-                });
+                runtime.block_on(async { runtime.spawn_compute(minimal_work).await });
                 total += start.elapsed();
             }
             total
@@ -317,11 +295,7 @@ fn bench_spawn_compute_pooling(c: &mut Criterion) {
     });
 
     group.bench_function("warm_pool_hit", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                runtime.spawn_compute(minimal_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { runtime.spawn_compute(minimal_work).await }));
     });
 
     // Benchmark pool exhaustion scenario
@@ -351,17 +325,13 @@ fn bench_current_runtime(c: &mut Criterion) {
     // Measure current_runtime() lookup time inside block_on
     group.bench_function("lookup_in_block_on", |b| {
         runtime.block_on(async {
-            b.iter(|| {
-                black_box(loom_rs::current_runtime())
-            });
+            b.iter(|| black_box(loom_rs::current_runtime()));
         });
     });
 
     // Measure current_runtime() outside runtime (should return None quickly)
     group.bench_function("lookup_outside_runtime", |b| {
-        b.iter(|| {
-            black_box(loom_rs::current_runtime())
-        });
+        b.iter(|| black_box(loom_rs::current_runtime()));
     });
 
     group.finish();
@@ -380,19 +350,11 @@ fn bench_ergonomic_spawn_compute(c: &mut Criterion) {
 
     // Compare direct vs ergonomic API
     group.bench_function("via_runtime_ref", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                runtime.spawn_compute(minimal_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { runtime.spawn_compute(minimal_work).await }));
     });
 
     group.bench_function("via_current_runtime", |b| {
-        b.iter(|| {
-            runtime.block_on(async {
-                loom_rs::spawn_compute(minimal_work).await
-            })
-        });
+        b.iter(|| runtime.block_on(async { loom_rs::spawn_compute(minimal_work).await }));
     });
 
     group.finish();

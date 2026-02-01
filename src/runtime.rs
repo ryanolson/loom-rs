@@ -39,30 +39,60 @@ use crate::pool::ComputePoolRegistry;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
-/// Helper to pass atomic counter reference to rayon tasks.
+/// State for tracking in-flight compute tasks.
 ///
-/// SAFETY: The counter lives in LoomRuntimeInner which outlives all rayon tasks
+/// Combines the task counter with a notification mechanism for efficient
+/// shutdown waiting (avoids spin loops).
+struct ComputeTaskState {
+    /// Number of tasks currently executing on rayon
+    count: AtomicUsize,
+    /// Notified when count reaches 0
+    notify: Notify,
+}
+
+impl ComputeTaskState {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+}
+
+/// Guard that decrements compute task counter on drop.
+///
+/// Panic-safe: executes even if the task closure panics.
+///
+/// SAFETY: The state lives in LoomRuntimeInner which outlives all rayon tasks
 /// because block_until_idle waits for compute_tasks to reach 0.
 struct ComputeTaskGuard {
-    counter: *const AtomicUsize,
+    state: *const ComputeTaskState,
 }
 
 unsafe impl Send for ComputeTaskGuard {}
 
 impl ComputeTaskGuard {
-    fn new(counter: &AtomicUsize) -> Self {
+    fn new(state: &ComputeTaskState) -> Self {
+        state.count.fetch_add(1, Ordering::Relaxed);
         Self {
-            counter: counter as *const AtomicUsize,
+            state: state as *const ComputeTaskState,
         }
     }
+}
 
-    fn decrement(&self) {
-        // SAFETY: counter outlives rayon tasks due to shutdown waiting
+impl Drop for ComputeTaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: state outlives rayon tasks due to shutdown waiting
         unsafe {
-            (*self.counter).fetch_sub(1, Ordering::Release);
+            let prev = (*self.state).count.fetch_sub(1, Ordering::Release);
+            if prev == 1 {
+                // Count just went from 1 to 0, notify waiters
+                (*self.state).notify.notify_waiters();
+            }
         }
     }
 }
@@ -131,7 +161,7 @@ pub struct LoomRuntimeInner {
     rayon_pool: rayon::ThreadPool,
     task_tracker: TaskTracker,
     /// Track in-flight rayon tasks for graceful shutdown
-    compute_tasks: AtomicUsize,
+    compute_state: ComputeTaskState,
     /// Per-type object pools for zero-allocation spawn_compute
     pools: ComputePoolRegistry,
 }
@@ -213,7 +243,7 @@ impl LoomRuntime {
                 tokio_runtime,
                 rayon_pool,
                 task_tracker: TaskTracker::new(),
-                compute_tasks: AtomicUsize::new(0),
+                compute_state: ComputeTaskState::new(),
                 pools: ComputePoolRegistry::new(pool_size),
             }
         });
@@ -480,7 +510,24 @@ impl LoomRuntime {
     pub fn is_idle(&self) -> bool {
         self.inner.task_tracker.is_closed()
             && self.inner.task_tracker.is_empty()
-            && self.inner.compute_tasks.load(Ordering::Acquire) == 0
+            && self.inner.compute_state.count.load(Ordering::Acquire) == 0
+    }
+
+    /// Get the number of compute tasks currently in flight.
+    ///
+    /// Useful for debugging shutdown issues or monitoring workload.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if runtime.compute_tasks_in_flight() > 0 {
+    ///     tracing::warn!("Still waiting for {} compute tasks",
+    ///         runtime.compute_tasks_in_flight());
+    /// }
+    /// ```
+    #[inline]
+    pub fn compute_tasks_in_flight(&self) -> usize {
+        self.inner.compute_state.count.load(Ordering::Relaxed)
     }
 
     /// Wait for all tracked tasks to complete (async).
@@ -500,9 +547,18 @@ impl LoomRuntime {
     pub async fn wait_for_shutdown(&self) {
         self.inner.task_tracker.wait().await;
 
-        // Spin-wait for rayon tasks (they complete quickly)
-        while self.inner.compute_tasks.load(Ordering::Acquire) > 0 {
-            tokio::task::yield_now().await;
+        // Wait for compute tasks efficiently (no spin loop)
+        let mut logged = false;
+        loop {
+            let count = self.inner.compute_state.count.load(Ordering::Acquire);
+            if count == 0 {
+                break;
+            }
+            if !logged {
+                debug!(count, "waiting for compute tasks to complete");
+                logged = true;
+            }
+            self.inner.compute_state.notify.notified().await;
         }
     }
 
@@ -541,19 +597,18 @@ impl LoomRuntimeInner {
     {
         let pool = self.pools.get_or_create::<R>();
 
-        self.compute_tasks.fetch_add(1, Ordering::Relaxed);
-
         // Try to get state from pool, or allocate new
         let state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
         // Create the pooled task
         let (task, completion, state_for_return) = PooledRayonTask::new(state);
 
-        let guard = ComputeTaskGuard::new(&self.compute_tasks);
+        // Create guard BEFORE spawning - it increments counter in constructor
+        let guard = ComputeTaskGuard::new(&self.compute_state);
 
         self.rayon_pool.spawn(move || {
+            let _guard = guard; // Moved here, drops at end (panic-safe)
             let result = f();
-            guard.decrement();
             completion.complete(result);
         });
 
@@ -573,7 +628,7 @@ impl std::fmt::Debug for LoomRuntime {
             .field("config", &self.inner.config)
             .field(
                 "compute_tasks_in_flight",
-                &self.inner.compute_tasks.load(Ordering::Relaxed),
+                &self.inner.compute_state.count.load(Ordering::Relaxed),
             )
             .finish_non_exhaustive()
     }
@@ -717,5 +772,56 @@ mod tests {
                 assert_eq!(result, i);
             }
         });
+    }
+
+    #[test]
+    fn test_spawn_compute_guard_drops_on_scope_exit() {
+        // This test verifies the guard's Drop implementation works correctly.
+        // We can't easily test panic behavior in rayon (panics abort by default),
+        // but we can verify the guard decrements the counter when it goes out of scope.
+        use std::sync::atomic::Ordering;
+
+        let state = super::ComputeTaskState::new();
+
+        // Create a guard (increments counter)
+        {
+            let _guard = super::ComputeTaskGuard::new(&state);
+            assert_eq!(state.count.load(Ordering::Relaxed), 1);
+        }
+        // Guard dropped, counter should be 0
+        assert_eq!(state.count.load(Ordering::Relaxed), 0);
+
+        // Test multiple guards
+        let state = super::ComputeTaskState::new();
+
+        let guard1 = super::ComputeTaskGuard::new(&state);
+        assert_eq!(state.count.load(Ordering::Relaxed), 1);
+
+        let guard2 = super::ComputeTaskGuard::new(&state);
+        assert_eq!(state.count.load(Ordering::Relaxed), 2);
+
+        drop(guard1);
+        assert_eq!(state.count.load(Ordering::Relaxed), 1);
+
+        drop(guard2);
+        assert_eq!(state.count.load(Ordering::Relaxed), 0);
+
+        // The notification mechanism is verified by the fact that wait_for_shutdown
+        // doesn't spin-loop forever when compute tasks complete
+    }
+
+    #[test]
+    fn test_compute_tasks_in_flight() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        // Initially no tasks
+        assert_eq!(runtime.compute_tasks_in_flight(), 0);
+
+        // After spawning and completing, should be back to 0
+        runtime.block_on(async {
+            runtime.spawn_compute(|| 42).await;
+        });
+        assert_eq!(runtime.compute_tasks_in_flight(), 0);
     }
 }

@@ -49,10 +49,9 @@ pub fn parse_cpuset(s: &str) -> Result<Vec<usize>> {
             let start: usize = start.trim().parse().map_err(|_| {
                 LoomError::InvalidCpuSet(format!("invalid range start in '{}'", part))
             })?;
-            let end: usize = end
-                .trim()
-                .parse()
-                .map_err(|_| LoomError::InvalidCpuSet(format!("invalid range end in '{}'", part)))?;
+            let end: usize = end.trim().parse().map_err(|_| {
+                LoomError::InvalidCpuSet(format!("invalid range end in '{}'", part))
+            })?;
 
             if start > end {
                 return Err(LoomError::InvalidCpuSet(format!(
@@ -153,10 +152,7 @@ mod tests {
             vec![0, 1, 2, 3, 8, 9, 10, 11]
         );
         assert_eq!(parse_cpuset("0,2,4,6").unwrap(), vec![0, 2, 4, 6]);
-        assert_eq!(
-            parse_cpuset("0,2-4,8").unwrap(),
-            vec![0, 2, 3, 4, 8]
-        );
+        assert_eq!(parse_cpuset("0,2-4,8").unwrap(), vec![0, 2, 3, 4, 8]);
     }
 
     #[test]
@@ -175,7 +171,10 @@ mod tests {
     #[test]
     fn test_parse_sorts() {
         assert_eq!(parse_cpuset("3,1,2,0").unwrap(), vec![0, 1, 2, 3]);
-        assert_eq!(parse_cpuset("8-11,0-3").unwrap(), vec![0, 1, 2, 3, 8, 9, 10, 11]);
+        assert_eq!(
+            parse_cpuset("8-11,0-3").unwrap(),
+            vec![0, 1, 2, 3, 8, 9, 10, 11]
+        );
     }
 
     #[test]

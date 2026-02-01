@@ -134,9 +134,7 @@ impl LoomBuilder {
     ///
     /// Default is 1 thread.
     pub fn tokio_threads(mut self, n: usize) -> Self {
-        self.figment = self
-            .figment
-            .merge(Serialized::default("tokio_threads", n));
+        self.figment = self.figment.merge(Serialized::default("tokio_threads", n));
         self
     }
 
@@ -144,9 +142,7 @@ impl LoomBuilder {
     ///
     /// Default is the remaining CPUs after tokio threads are allocated.
     pub fn rayon_threads(mut self, n: usize) -> Self {
-        self.figment = self
-            .figment
-            .merge(Serialized::default("rayon_threads", n));
+        self.figment = self.figment.merge(Serialized::default("rayon_threads", n));
         self
     }
 

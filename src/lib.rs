@@ -221,9 +221,7 @@ where
 ///     let result = future.await;
 /// }
 /// ```
-pub fn try_spawn_compute<F, R>(
-    f: F,
-) -> Option<impl std::future::Future<Output = R>>
+pub fn try_spawn_compute<F, R>(f: F) -> Option<impl std::future::Future<Output = R>>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
