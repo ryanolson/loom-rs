@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Weaving multiple threads together - A bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities"
 license = "MIT"
-repository = "https://github.com/yourusername/loom-rs"
+repository = "https://github.com/ryanolson/loom-rs"
 keywords = ["async", "runtime", "threadpool", "cpu-affinity", "tokio"]
 categories = ["asynchronous", "concurrency"]
 
