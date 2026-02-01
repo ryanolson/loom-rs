@@ -198,21 +198,18 @@ where
         let this = &mut *self;
 
         // Initialize state on first poll
-        let state = if this.state.is_none() {
+        let state = this.state.get_or_insert_with(|| {
             let runtime = current_runtime().expect("compute_map used outside loom runtime");
             let pool = runtime.pools.get_or_create::<U>();
             let task_state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
-            this.state = Some(ComputeMapState {
+            ComputeMapState {
                 runtime,
                 pool,
                 task_state,
                 pending: None,
-            });
-            this.state.as_mut().unwrap()
-        } else {
-            this.state.as_mut().unwrap()
-        };
+            }
+        });
 
         // If we have a pending task, poll it first
         if let Some(ref mut pending) = state.pending {
