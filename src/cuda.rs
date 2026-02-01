@@ -31,14 +31,16 @@ pub enum CudaDeviceSelector {
 /// 3. Gets the NUMA node ID for the device
 /// 4. Uses hwlocality to find CPUs in that NUMA node
 ///
+/// Returns `Some(cpus)` if the local CPU set was successfully determined,
+/// or `None` if locality could not be determined (caller should decide fallback).
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - NVML cannot be initialized
 /// - The device cannot be found
-/// - The NUMA node cannot be determined
-/// - hwlocality fails to enumerate CPUs
-pub fn cpuset_for_cuda_device(selector: &CudaDeviceSelector) -> Result<Vec<usize>> {
+/// - hwlocality fails to initialize
+pub fn cpuset_for_cuda_device(selector: &CudaDeviceSelector) -> Result<Option<Vec<usize>>> {
     let nvml = Nvml::init()?;
 
     let device = match selector {
@@ -68,15 +70,15 @@ pub fn cpuset_for_cuda_device(selector: &CudaDeviceSelector) -> Result<Vec<usize
     // Find the PCI device in the topology and get its NUMA node
     let cpus = find_cpus_for_pci_device(&topology, &pci_info.bus_id)?;
 
-    info!(cpus = ?cpus, "found CPUs local to CUDA device");
-
     if cpus.is_empty() {
-        // Fall back to all CPUs if we can't determine locality
-        debug!("falling back to all CPUs");
-        return Ok(crate::cpuset::available_cpus());
+        // Could not determine locality
+        debug!("could not determine CPU locality for CUDA device");
+        return Ok(None);
     }
 
-    Ok(cpus)
+    info!(cpus = ?cpus, "found CPUs local to CUDA device");
+
+    Ok(Some(cpus))
 }
 
 fn find_cpus_for_pci_device(topology: &Topology, pci_bus_id: &str) -> Result<Vec<usize>> {
@@ -160,8 +162,9 @@ mod tests {
     #[cfg(feature = "cuda-tests")]
     #[test]
     fn test_cpuset_for_cuda_device() {
-        let cpus =
-            cpuset_for_cuda_device(&CudaDeviceSelector::DeviceId(0)).expect("Should find CPUs");
+        let cpus = cpuset_for_cuda_device(&CudaDeviceSelector::DeviceId(0))
+            .expect("Should not error")
+            .expect("Should find CPUs for device 0");
         assert!(!cpus.is_empty(), "Should have CPUs for device 0");
         println!("CPUs for CUDA device 0: {:?}", cpus);
     }
