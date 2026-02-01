@@ -79,8 +79,17 @@ impl RuntimeMetrics {
     #[inline]
     pub fn rayon_completed(&self) {
         // Decrement both counters to maintain queue depth accuracy
-        self.rayon_submitted.fetch_sub(1, Ordering::Relaxed);
-        self.rayon_started.fetch_sub(1, Ordering::Relaxed);
+        // Use fetch_update with saturating_sub for safety against underflow
+        let _ = self
+            .rayon_submitted
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+        let _ = self
+            .rayon_started
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     /// Get the current number of in-flight tasks.

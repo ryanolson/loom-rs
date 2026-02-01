@@ -385,7 +385,8 @@ struct AdaptiveMapState<U: Send + 'static> {
 impl<U: Send + 'static> Drop for AdaptiveMapState<U> {
     fn drop(&mut self) {
         // Return TaskState to pool if there's no pending offload task
-        if self.pending.is_none() {
+        // Skip cleanup during panic to avoid potential double-panic
+        if self.pending.is_none() && !std::thread::panicking() {
             self.task_state.reset();
             let task_state = Arc::clone(&self.task_state);
             self.pool.push(task_state);
