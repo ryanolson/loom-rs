@@ -155,6 +155,8 @@ pub mod config;
 pub(crate) mod context;
 pub mod cpuset;
 pub mod error;
+pub mod mab;
+pub mod metrics;
 pub(crate) mod pool;
 pub mod runtime;
 pub mod stream;
@@ -166,6 +168,8 @@ pub use builder::{LoomArgs, LoomBuilder};
 pub use config::LoomConfig;
 pub use context::current_runtime;
 pub use error::{LoomError, Result};
+pub use mab::{ComputeHint, ComputeHintProvider, MabKnobs, MabScheduler};
+pub use metrics::LoomMetrics;
 pub use runtime::{LoomRuntime, LoomRuntimeInner};
 pub use stream::ComputeStreamExt;
 

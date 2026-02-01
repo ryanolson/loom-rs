@@ -34,11 +34,13 @@ use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
 use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
 use crate::error::{LoomError, Result};
+use crate::mab::{Context, MabKnobs, MabScheduler, RuntimeMetrics};
+use crate::metrics::LoomMetrics;
 use crate::pool::ComputePoolRegistry;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
@@ -165,13 +167,21 @@ pub struct LoomRuntimeInner {
     /// Per-type object pools for zero-allocation spawn_compute
     pub(crate) pools: ComputePoolRegistry,
     /// Number of tokio worker threads
-    tokio_threads: usize,
+    pub(crate) tokio_threads: usize,
     /// Number of rayon worker threads
-    rayon_threads: usize,
+    pub(crate) rayon_threads: usize,
     /// CPUs allocated to tokio workers
-    tokio_cpus: Vec<usize>,
+    pub(crate) tokio_cpus: Vec<usize>,
     /// CPUs allocated to rayon workers
-    rayon_cpus: Vec<usize>,
+    pub(crate) rayon_cpus: Vec<usize>,
+    /// Runtime metrics for MAB scheduling
+    pub(crate) metrics: RuntimeMetrics,
+    /// Lazily initialized shared MAB scheduler
+    mab_scheduler: OnceLock<Arc<MabScheduler>>,
+    /// MAB knobs configuration
+    mab_knobs: MabKnobs,
+    /// Prometheus metrics (always active, registry optional)
+    pub(crate) prometheus_metrics: LoomMetrics,
 }
 
 impl LoomRuntime {
@@ -180,17 +190,43 @@ impl LoomRuntime {
     /// This is typically called via `LoomBuilder::build()`.
     pub(crate) fn from_config(config: LoomConfig, pool_size: usize) -> Result<Self> {
         // Determine available CPUs
-        let cpus = if let Some(ref cpuset_str) = config.cpuset {
-            parse_and_validate_cpuset(cpuset_str)?
-        } else {
+        // Priority: CUDA device cpuset > user cpuset > all available CPUs
+        // Error if both cuda_device and cpuset are specified and CUDA cpuset is accurate
+        let cpus = {
             #[cfg(feature = "cuda")]
-            if let Some(ref selector) = config.cuda_device {
-                crate::cuda::cpuset_for_cuda_device(selector)?
-            } else {
-                available_cpus()
+            {
+                if let Some(ref selector) = config.cuda_device {
+                    match crate::cuda::cpuset_for_cuda_device(selector)? {
+                        Some(cuda_cpus) => {
+                            // CUDA cpuset was successfully determined
+                            if config.cpuset.is_some() {
+                                return Err(LoomError::CudaCpusetConflict);
+                            }
+                            cuda_cpus
+                        }
+                        None => {
+                            // Could not determine CUDA locality, fall back
+                            if let Some(ref cpuset_str) = config.cpuset {
+                                parse_and_validate_cpuset(cpuset_str)?
+                            } else {
+                                available_cpus()
+                            }
+                        }
+                    }
+                } else if let Some(ref cpuset_str) = config.cpuset {
+                    parse_and_validate_cpuset(cpuset_str)?
+                } else {
+                    available_cpus()
+                }
             }
             #[cfg(not(feature = "cuda"))]
-            available_cpus()
+            {
+                if let Some(ref cpuset_str) = config.cpuset {
+                    parse_and_validate_cpuset(cpuset_str)?
+                } else {
+                    available_cpus()
+                }
+            }
         };
 
         if cpus.is_empty() {
@@ -251,6 +287,19 @@ impl LoomRuntime {
                 Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus.clone(), weak_clone)
                     .expect("failed to build rayon pool");
 
+            // Extract MAB knobs, using defaults if not configured
+            let mab_knobs = config.mab_knobs.clone().unwrap_or_default();
+
+            // Create Prometheus metrics
+            let prometheus_metrics = LoomMetrics::new();
+
+            // Register with provided registry if available
+            if let Some(ref registry) = config.prometheus_registry {
+                if let Err(e) = prometheus_metrics.register(registry) {
+                    warn!(%e, "failed to register prometheus metrics");
+                }
+            }
+
             LoomRuntimeInner {
                 config,
                 tokio_runtime,
@@ -262,6 +311,10 @@ impl LoomRuntime {
                 rayon_threads,
                 tokio_cpus,
                 rayon_cpus,
+                metrics: RuntimeMetrics::new(),
+                mab_scheduler: OnceLock::new(),
+                mab_knobs,
+                prometheus_metrics,
             }
         });
 
@@ -600,6 +653,83 @@ impl LoomRuntime {
         self.shutdown();
         self.block_on(self.wait_for_shutdown());
     }
+
+    /// Get the shared MAB scheduler for handler patterns.
+    ///
+    /// The scheduler is lazily initialized on first call. Use this when you
+    /// need to make manual scheduling decisions in handler code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use loom_rs::mab::{FunctionKey, Arm};
+    ///
+    /// let sched = runtime.mab_scheduler();
+    /// let key = FunctionKey::from_type::<MyHandler>();
+    /// let ctx = runtime.collect_context();
+    ///
+    /// let (id, arm) = sched.choose(key, &ctx);
+    /// let result = match arm {
+    ///     Arm::InlineTokio => my_work(),
+    ///     Arm::OffloadRayon => runtime.block_on(async {
+    ///         runtime.spawn_compute(|| my_work()).await
+    ///     }),
+    /// };
+    /// sched.finish(id, elapsed_us, Some(fn_us));
+    /// ```
+    pub fn mab_scheduler(&self) -> Arc<MabScheduler> {
+        self.inner
+            .mab_scheduler
+            .get_or_init(|| Arc::new(MabScheduler::new(self.inner.mab_knobs.clone())))
+            .clone()
+    }
+
+    /// Collect current runtime context for MAB scheduling decisions.
+    ///
+    /// Returns a snapshot of current metrics including inflight tasks,
+    /// spawn rate, and queue depth.
+    pub fn collect_context(&self) -> Context {
+        self.inner.metrics.collect(
+            self.inner.tokio_threads as u32,
+            self.inner.rayon_threads as u32,
+        )
+    }
+
+    /// Get the runtime metrics.
+    ///
+    /// Primarily used internally by the MAB scheduler and stream adapters.
+    pub fn metrics(&self) -> &RuntimeMetrics {
+        &self.inner.metrics
+    }
+
+    /// Get the number of tokio worker threads.
+    pub fn tokio_threads(&self) -> usize {
+        self.inner.tokio_threads
+    }
+
+    /// Get the number of rayon threads.
+    pub fn rayon_threads(&self) -> usize {
+        self.inner.rayon_threads
+    }
+
+    /// Get the Prometheus metrics.
+    ///
+    /// The metrics are always collected (zero overhead atomic operations).
+    /// If a Prometheus registry was provided via `LoomBuilder::prometheus_registry()`,
+    /// the metrics are also registered for exposition.
+    pub fn prometheus_metrics(&self) -> &LoomMetrics {
+        &self.inner.prometheus_metrics
+    }
+
+    /// Get the CPUs allocated to tokio workers.
+    pub fn tokio_cpus(&self) -> &[usize] {
+        &self.inner.tokio_cpus
+    }
+
+    /// Get the CPUs allocated to rayon workers.
+    pub fn rayon_cpus(&self) -> &[usize] {
+        &self.inner.rayon_cpus
+    }
 }
 
 impl LoomRuntimeInner {
@@ -683,6 +813,9 @@ mod tests {
             compute_pool_size: DEFAULT_POOL_SIZE,
             #[cfg(feature = "cuda")]
             cuda_device: None,
+            mab_knobs: None,
+            calibration: None,
+            prometheus_registry: None,
         }
     }
 
@@ -869,5 +1002,47 @@ mod tests {
         assert!(display.starts_with("LoomRuntime[test]:"));
         assert!(display.contains("tokio(1, cpus="));
         assert!(display.contains("rayon(1, cpus="));
+    }
+
+    #[test]
+    fn test_cpuset_only() {
+        let mut config = test_config();
+        config.cpuset = Some("0".to_string());
+        config.tokio_threads = Some(1);
+        config.rayon_threads = Some(0);
+
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        // Should use the user-provided cpuset
+        assert_eq!(runtime.inner.tokio_cpus, vec![0]);
+    }
+
+    /// Test that CUDA cpuset conflict error is properly detected.
+    /// This test requires actual CUDA hardware to verify the conflict.
+    #[cfg(feature = "cuda-tests")]
+    #[test]
+    fn test_cuda_cpuset_conflict_error() {
+        let mut config = test_config();
+        config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
+        config.cpuset = Some("0".to_string()); // Conflict: both specified
+
+        let result = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE);
+        assert!(
+            matches!(result, Err(LoomError::CudaCpusetConflict)),
+            "expected CudaCpusetConflict error, got {:?}",
+            result
+        );
+    }
+
+    /// Test that CUDA device alone (without cpuset) works.
+    #[cfg(feature = "cuda-tests")]
+    #[test]
+    fn test_cuda_device_only() {
+        let mut config = test_config();
+        config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
+        config.cpuset = None;
+
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        // Should have found CUDA-local CPUs
+        assert!(!runtime.inner.tokio_cpus.is_empty());
     }
 }

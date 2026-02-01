@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaDeviceSelector;
 
+use crate::mab::{CalibrationConfig, MabKnobs};
 use crate::pool::DEFAULT_POOL_SIZE;
+use prometheus::Registry;
 
 /// Configuration for the Loom runtime.
 ///
@@ -37,6 +39,22 @@ pub struct LoomConfig {
     #[cfg(feature = "cuda")]
     #[serde(default)]
     pub cuda_device: Option<CudaDeviceSelector>,
+
+    /// MAB scheduler configuration knobs.
+    /// If None, default knobs are used.
+    #[serde(default)]
+    pub mab_knobs: Option<MabKnobs>,
+
+    /// Calibration configuration.
+    /// If None or disabled, calibration is skipped.
+    #[serde(default)]
+    pub calibration: Option<CalibrationConfig>,
+
+    /// Prometheus registry for metrics exposition.
+    /// If provided, metrics will be registered for scraping.
+    /// Not serializable - must be set programmatically.
+    #[serde(skip)]
+    pub prometheus_registry: Option<Registry>,
 }
 
 fn default_compute_pool_size() -> usize {
@@ -57,6 +75,9 @@ impl Default for LoomConfig {
             compute_pool_size: default_compute_pool_size(),
             #[cfg(feature = "cuda")]
             cuda_device: None,
+            mab_knobs: None,
+            calibration: None,
+            prometheus_registry: None,
         }
     }
 }
@@ -96,6 +117,8 @@ mod tests {
         assert!(config.tokio_threads.is_none());
         assert!(config.rayon_threads.is_none());
         assert_eq!(config.compute_pool_size, 64);
+        assert!(config.mab_knobs.is_none());
+        assert!(config.calibration.is_none());
     }
 
     #[test]
