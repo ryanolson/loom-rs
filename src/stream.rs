@@ -430,8 +430,8 @@ where
             let pool = runtime.pools.get_or_create::<U>();
             let task_state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
-            // Create a per-stream scheduler with default knobs
-            let scheduler = MabScheduler::with_defaults();
+            // Create a per-stream scheduler with runtime's configured knobs
+            let scheduler = MabScheduler::new(runtime.mab_knobs.clone());
 
             AdaptiveMapState {
                 runtime,

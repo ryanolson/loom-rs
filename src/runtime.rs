@@ -67,29 +67,70 @@ impl ComputeTaskState {
 
 /// Guard that decrements compute task counter on drop.
 ///
+/// Guard for tracking async task metrics.
+///
+/// Panic-safe: task_completed is called even if the future panics.
+struct AsyncMetricsGuard {
+    inner: Arc<LoomRuntimeInner>,
+}
+
+impl AsyncMetricsGuard {
+    fn new(inner: Arc<LoomRuntimeInner>) -> Self {
+        inner.metrics.task_started();
+        Self { inner }
+    }
+}
+
+impl Drop for AsyncMetricsGuard {
+    fn drop(&mut self) {
+        self.inner.metrics.task_completed();
+    }
+}
+
+/// Guard for tracking compute task state and metrics.
+///
 /// Panic-safe: executes even if the task closure panics.
 ///
 /// SAFETY: The state lives in LoomRuntimeInner which outlives all rayon tasks
 /// because block_until_idle waits for compute_tasks to reach 0.
 struct ComputeTaskGuard {
     state: *const ComputeTaskState,
+    metrics: *const RuntimeMetrics,
 }
 
 unsafe impl Send for ComputeTaskGuard {}
 
 impl ComputeTaskGuard {
-    fn new(state: &ComputeTaskState) -> Self {
+    /// Create a new guard, tracking submission in MAB metrics.
+    ///
+    /// This should be called BEFORE spawning on rayon.
+    fn new(state: &ComputeTaskState, metrics: &RuntimeMetrics) -> Self {
         state.count.fetch_add(1, Ordering::Relaxed);
+        metrics.rayon_submitted();
         Self {
             state: state as *const ComputeTaskState,
+            metrics: metrics as *const RuntimeMetrics,
+        }
+    }
+
+    /// Mark that the rayon task has started executing.
+    ///
+    /// This should be called at the START of the rayon closure.
+    fn started(&self) {
+        // SAFETY: metrics outlives rayon tasks
+        unsafe {
+            (*self.metrics).rayon_started();
         }
     }
 }
 
 impl Drop for ComputeTaskGuard {
     fn drop(&mut self) {
-        // SAFETY: state outlives rayon tasks due to shutdown waiting
+        // SAFETY: state and metrics outlive rayon tasks due to shutdown waiting
         unsafe {
+            // Track MAB metrics completion (panic-safe)
+            (*self.metrics).rayon_completed();
+
             let prev = (*self.state).count.fetch_sub(1, Ordering::Release);
             if prev == 1 {
                 // Count just went from 1 to 0, notify waiters
@@ -179,7 +220,7 @@ pub struct LoomRuntimeInner {
     /// Lazily initialized shared MAB scheduler
     mab_scheduler: OnceLock<Arc<MabScheduler>>,
     /// MAB knobs configuration
-    mab_knobs: MabKnobs,
+    pub(crate) mab_knobs: MabKnobs,
     /// Prometheus metrics (always active, registry optional)
     pub(crate) prometheus_metrics: LoomMetrics,
 }
@@ -485,9 +526,12 @@ impl LoomRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // Track task for MAB metrics (panic-safe via guard)
+        let metrics_guard = AsyncMetricsGuard::new(Arc::clone(&self.inner));
         let token = self.inner.task_tracker.token();
         self.inner.tokio_runtime.spawn(async move {
-            let _guard = token;
+            let _tracker = token;
+            let _metrics = metrics_guard;
             future.await
         })
     }
@@ -737,7 +781,7 @@ impl LoomRuntimeInner {
     ///
     /// Uses per-type object pools for zero allocation after warmup.
     #[inline]
-    pub async fn spawn_compute<F, R>(&self, f: F) -> R
+    pub async fn spawn_compute<F, R>(self: &Arc<Self>, f: F) -> R
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -750,10 +794,13 @@ impl LoomRuntimeInner {
         // Create the pooled task
         let (task, completion, state_for_return) = PooledRayonTask::new(state);
 
-        // Create guard BEFORE spawning - it increments counter in constructor
-        let guard = ComputeTaskGuard::new(&self.compute_state);
+        // Create guard BEFORE spawning - it increments counter and tracks MAB metrics
+        let guard = ComputeTaskGuard::new(&self.compute_state, &self.metrics);
 
         self.rayon_pool.spawn(move || {
+            // Track rayon task start for queue depth calculation
+            guard.started();
+
             // Execute work inside guard scope so counter decrements BEFORE completing.
             // This ensures the async future sees count=0 when it wakes up.
             let result = {
@@ -950,10 +997,11 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let state = super::ComputeTaskState::new();
+        let metrics = crate::mab::RuntimeMetrics::new();
 
         // Create a guard (increments counter)
         {
-            let _guard = super::ComputeTaskGuard::new(&state);
+            let _guard = super::ComputeTaskGuard::new(&state, &metrics);
             assert_eq!(state.count.load(Ordering::Relaxed), 1);
         }
         // Guard dropped, counter should be 0
@@ -962,10 +1010,10 @@ mod tests {
         // Test multiple guards
         let state = super::ComputeTaskState::new();
 
-        let guard1 = super::ComputeTaskGuard::new(&state);
+        let guard1 = super::ComputeTaskGuard::new(&state, &metrics);
         assert_eq!(state.count.load(Ordering::Relaxed), 1);
 
-        let guard2 = super::ComputeTaskGuard::new(&state);
+        let guard2 = super::ComputeTaskGuard::new(&state, &metrics);
         assert_eq!(state.count.load(Ordering::Relaxed), 2);
 
         drop(guard1);
