@@ -12,6 +12,16 @@ A Rust crate providing a bespoke thread pool runtime combining tokio and rayon w
 - **CLI Integration**: Built-in clap support for command-line overrides
 - **CUDA NUMA Awareness**: Optional feature for selecting CPUs local to a GPU (Linux only)
 
+## Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Linux | **Full support** | All features including CPU pinning and CUDA |
+| macOS | Partial | Compiles and runs, but CPU pinning may silently fail |
+| Windows | Partial | Compiles and runs, but CPU pinning may silently fail |
+
+**Note**: CPU affinity (thread pinning) is a Linux-focused feature. On macOS and Windows, pinning calls may return failure or have no effect. The library remains functional for development and testing, but production deployments targeting performance should use Linux.
+
 ## Installation
 
 Add to your `Cargo.toml`:

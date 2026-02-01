@@ -166,6 +166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_pin_to_cpu() {
         // Pin to CPU 0 should generally work
         let result = pin_to_cpu(0);
@@ -177,6 +178,7 @@ mod tests {
     // bounds checking in the libc sched_setaffinity wrapper).
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_make_pin_handler() {
         let allocator = Arc::new(CpuAllocator::new(vec![0]));
         let handler = make_pin_handler(allocator, "test".into());
