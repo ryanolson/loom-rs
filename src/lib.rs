@@ -1,0 +1,235 @@
+//! # loom-rs
+//!
+//! **Weaving multiple threads together**
+//!
+//! A bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities.
+//!
+//! ## Features
+//!
+//! - **Hybrid Runtime**: Combines tokio for async I/O with rayon for CPU-bound parallel work
+//! - **CPU Pinning**: Automatically pins threads to specific CPUs for consistent performance
+//! - **Zero Allocation**: `spawn_compute()` uses per-type pools for zero allocation after warmup
+//! - **Flexible Configuration**: Configure via files (TOML/YAML/JSON), environment variables, or code
+//! - **CLI Integration**: Built-in clap support for command-line overrides
+//! - **CUDA NUMA Awareness**: Optional feature for selecting CPUs local to a GPU (Linux only)
+//!
+//! ## Quick Start
+//!
+//! ```ignore
+//! use loom_rs::LoomBuilder;
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let runtime = LoomBuilder::new()
+//!         .prefix("myapp")
+//!         .tokio_threads(2)
+//!         .rayon_threads(6)
+//!         .build()?;
+//!
+//!     runtime.block_on(async {
+//!         // Spawn tracked async I/O task
+//!         let io_handle = runtime.spawn_async(async {
+//!             // Async I/O work
+//!             42
+//!         });
+//!
+//!         // Spawn tracked compute task and await result (zero alloc after warmup)
+//!         let result = runtime.spawn_compute(|| {
+//!             // CPU-bound work on rayon
+//!             (0..1000000).sum::<i64>()
+//!         }).await;
+//!         println!("Compute result: {}", result);
+//!
+//!         // Zero-overhead parallel iterators
+//!         let _sum = runtime.install(|| {
+//!             use rayon::prelude::*;
+//!             (0..1000).into_par_iter().sum::<i64>()
+//!         });
+//!
+//!         // Wait for async task
+//!         let io_result = io_handle.await.unwrap();
+//!         println!("I/O result: {}", io_result);
+//!     });
+//!
+//!     // Graceful shutdown
+//!     runtime.block_until_idle();
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Ergonomic Access
+//!
+//! Use `current_runtime()` or `spawn_compute()` from anywhere in the runtime:
+//!
+//! ```ignore
+//! use loom_rs::LoomBuilder;
+//!
+//! let runtime = LoomBuilder::new().build()?;
+//!
+//! runtime.block_on(async {
+//!     // No need to pass &runtime around
+//!     let result = loom_rs::spawn_compute(|| expensive_work()).await;
+//!
+//!     // Or get the runtime explicitly
+//!     let rt = loom_rs::current_runtime().unwrap();
+//!     rt.spawn_async(async { /* ... */ });
+//! });
+//! ```
+//!
+//! ## Configuration
+//!
+//! Configuration sources are merged in order (later sources override earlier):
+//!
+//! 1. Default values
+//! 2. Config files (via `.file()`)
+//! 3. Environment variables (via `.env_prefix()`)
+//! 4. Programmatic overrides
+//! 5. CLI arguments (via `.with_cli_args()`)
+//!
+//! ### Config File Example (TOML)
+//!
+//! ```toml
+//! prefix = "myapp"
+//! cpuset = "0-7,16-23"
+//! tokio_threads = 2
+//! rayon_threads = 14
+//! compute_pool_size = 64
+//! ```
+//!
+//! ### Environment Variables
+//!
+//! With `.env_prefix("LOOM")`:
+//! - `LOOM_PREFIX=myapp`
+//! - `LOOM_CPUSET=0-7`
+//! - `LOOM_TOKIO_THREADS=2`
+//! - `LOOM_RAYON_THREADS=6`
+//!
+//! ### CLI Arguments
+//!
+//! ```ignore
+//! use clap::Parser;
+//! use loom_rs::{LoomBuilder, LoomArgs};
+//!
+//! #[derive(Parser)]
+//! struct MyArgs {
+//!     #[command(flatten)]
+//!     loom: LoomArgs,
+//! }
+//!
+//! let args = MyArgs::parse();
+//! let runtime = LoomBuilder::new()
+//!     .file("config.toml")
+//!     .env_prefix("LOOM")
+//!     .with_cli_args(&args.loom)
+//!     .build()?;
+//! ```
+//!
+//! ## CPU Set Format
+//!
+//! The `cpuset` option accepts a string in Linux taskset/numactl format:
+//! - Single CPUs: `"0"`, `"5"`
+//! - Ranges: `"0-7"`, `"16-23"`
+//! - Mixed: `"0-3,8-11"`, `"0,2,4,6-8"`
+//!
+//! ## CUDA Support
+//!
+//! With the `cuda` feature enabled (Linux only), you can configure the runtime
+//! to use CPUs local to a specific CUDA GPU:
+//!
+//! ```ignore
+//! let runtime = LoomBuilder::new()
+//!     .cuda_device_id(0)  // Use CPUs near GPU 0
+//!     .build()?;
+//! ```
+//!
+//! ## Thread Naming
+//!
+//! Threads are named with the configured prefix:
+//! - Tokio threads: `{prefix}-tokio-0000`, `{prefix}-tokio-0001`, ...
+//! - Rayon threads: `{prefix}-rayon-0000`, `{prefix}-rayon-0001`, ...
+
+pub mod affinity;
+pub mod bridge;
+pub mod builder;
+pub mod config;
+pub(crate) mod context;
+pub mod cpuset;
+pub mod error;
+pub(crate) mod pool;
+pub mod runtime;
+
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
+pub use builder::{LoomArgs, LoomBuilder};
+pub use config::LoomConfig;
+pub use context::current_runtime;
+pub use error::{LoomError, Result};
+pub use runtime::{LoomRuntime, LoomRuntimeInner};
+
+/// Spawn compute work using the current runtime.
+///
+/// This is a convenience function for `loom_rs::current_runtime().unwrap().spawn_compute(f)`.
+/// It allows spawning compute work from anywhere within a loom runtime without
+/// explicitly passing the runtime reference.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context (i.e., not within `block_on`,
+/// a tokio worker thread, or a rayon worker thread managed by the runtime).
+///
+/// # Performance
+///
+/// Same as `LoomRuntime::spawn_compute()`:
+/// - 0 bytes allocation after warmup (pool hit)
+/// - ~100-500ns overhead
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::LoomBuilder;
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     // No need to pass &runtime around
+///     let result = loom_rs::spawn_compute(|| {
+///         expensive_work()
+///     }).await;
+/// });
+/// ```
+pub async fn spawn_compute<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    current_runtime()
+        .expect("spawn_compute called outside loom runtime")
+        .spawn_compute(f)
+        .await
+}
+
+/// Try to spawn compute work using the current runtime.
+///
+/// Like `spawn_compute()`, but returns `None` if not in a runtime context
+/// instead of panicking.
+///
+/// # Example
+///
+/// ```ignore
+/// if let Some(future) = loom_rs::try_spawn_compute(|| work()) {
+///     let result = future.await;
+/// }
+/// ```
+pub fn try_spawn_compute<F, R>(
+    f: F,
+) -> Option<impl std::future::Future<Output = R>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    current_runtime().map(|rt| {
+        let rt = rt;
+        async move { rt.spawn_compute(f).await }
+    })
+}
