@@ -148,8 +148,8 @@
 //! - Tokio threads: `{prefix}-tokio-0000`, `{prefix}-tokio-0001`, ...
 //! - Rayon threads: `{prefix}-rayon-0000`, `{prefix}-rayon-0001`, ...
 
-pub mod affinity;
-pub mod bridge;
+pub(crate) mod affinity;
+pub(crate) mod bridge;
 pub mod builder;
 pub mod config;
 pub(crate) mod context;

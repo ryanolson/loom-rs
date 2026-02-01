@@ -3,6 +3,8 @@
 //! This module provides utilities for pinning threads to specific CPUs
 //! using the `core_affinity` crate.
 
+#![allow(dead_code)]
+
 use crate::error::{LoomError, Result};
 use core_affinity::CoreId;
 use std::sync::atomic::{AtomicUsize, Ordering};
