@@ -472,7 +472,7 @@ where
                 let hint = item.compute_hint();
 
                 // Collect runtime context
-                let ctx = state.runtime.metrics.collect(
+                let ctx = state.runtime.prometheus_metrics.collect_context(
                     state.runtime.tokio_threads as u32,
                     state.runtime.rayon_threads as u32,
                 );

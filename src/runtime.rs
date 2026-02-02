@@ -34,7 +34,7 @@ use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
 use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
 use crate::error::{LoomError, Result};
-use crate::mab::{Arm, ComputeHint, Context, FunctionKey, MabKnobs, MabScheduler, RuntimeMetrics};
+use crate::mab::{Arm, ComputeHint, Context, FunctionKey, MabKnobs, MabScheduler};
 use crate::metrics::LoomMetrics;
 use crate::pool::ComputePoolRegistry;
 
@@ -66,8 +66,6 @@ impl ComputeTaskState {
     }
 }
 
-/// Guard that decrements compute task counter on drop.
-///
 /// Guard for tracking async task metrics.
 ///
 /// Panic-safe: task_completed is called even if the future panics.
@@ -77,14 +75,14 @@ struct AsyncMetricsGuard {
 
 impl AsyncMetricsGuard {
     fn new(inner: Arc<LoomRuntimeInner>) -> Self {
-        inner.metrics.task_started();
+        inner.prometheus_metrics.task_started();
         Self { inner }
     }
 }
 
 impl Drop for AsyncMetricsGuard {
     fn drop(&mut self) {
-        self.inner.metrics.task_completed();
+        self.inner.prometheus_metrics.task_completed();
     }
 }
 
@@ -96,7 +94,7 @@ impl Drop for AsyncMetricsGuard {
 /// because block_until_idle waits for compute_tasks to reach 0.
 struct ComputeTaskGuard {
     state: *const ComputeTaskState,
-    metrics: *const RuntimeMetrics,
+    metrics: *const LoomMetrics,
 }
 
 unsafe impl Send for ComputeTaskGuard {}
@@ -105,12 +103,12 @@ impl ComputeTaskGuard {
     /// Create a new guard, tracking submission in MAB metrics.
     ///
     /// This should be called BEFORE spawning on rayon.
-    fn new(state: &ComputeTaskState, metrics: &RuntimeMetrics) -> Self {
+    fn new(state: &ComputeTaskState, metrics: &LoomMetrics) -> Self {
         state.count.fetch_add(1, Ordering::Relaxed);
         metrics.rayon_submitted();
         Self {
             state: state as *const ComputeTaskState,
-            metrics: metrics as *const RuntimeMetrics,
+            metrics: metrics as *const LoomMetrics,
         }
     }
 
@@ -216,13 +214,12 @@ pub(crate) struct LoomRuntimeInner {
     pub(crate) tokio_cpus: Vec<usize>,
     /// CPUs allocated to rayon workers
     pub(crate) rayon_cpus: Vec<usize>,
-    /// Runtime metrics for MAB scheduling
-    pub(crate) metrics: RuntimeMetrics,
     /// Lazily initialized shared MAB scheduler
     mab_scheduler: OnceLock<Arc<MabScheduler>>,
     /// MAB knobs configuration
     pub(crate) mab_knobs: MabKnobs,
-    /// Prometheus metrics (always active, registry optional)
+    /// Prometheus metrics - single source of truth for all metrics
+    /// (serves both Prometheus exposition and MAB scheduling)
     pub(crate) prometheus_metrics: LoomMetrics,
 }
 
@@ -360,7 +357,6 @@ impl LoomRuntime {
                 rayon_threads,
                 tokio_cpus,
                 rayon_cpus,
-                metrics: RuntimeMetrics::new(),
                 mab_scheduler: OnceLock::new(),
                 mab_knobs,
                 prometheus_metrics,
@@ -828,17 +824,10 @@ impl LoomRuntime {
     /// Returns a snapshot of current metrics including inflight tasks,
     /// spawn rate, and queue depth.
     pub fn collect_context(&self) -> Context {
-        self.inner.metrics.collect(
+        self.inner.prometheus_metrics.collect_context(
             self.inner.tokio_threads as u32,
             self.inner.rayon_threads as u32,
         )
-    }
-
-    /// Get the runtime metrics.
-    ///
-    /// Primarily used internally by the MAB scheduler and stream adapters.
-    pub fn metrics(&self) -> &RuntimeMetrics {
-        &self.inner.metrics
     }
 
     /// Get the number of tokio worker threads.
@@ -890,7 +879,7 @@ impl LoomRuntimeInner {
         let (task, completion, state_for_return) = PooledRayonTask::new(state);
 
         // Create guard BEFORE spawning - it increments counter and tracks MAB metrics
-        let guard = ComputeTaskGuard::new(&self.compute_state, &self.metrics);
+        let guard = ComputeTaskGuard::new(&self.compute_state, &self.prometheus_metrics);
 
         self.rayon_pool.spawn(move || {
             // Track rayon task start for queue depth calculation
@@ -1089,10 +1078,11 @@ mod tests {
         // This test verifies the guard's Drop implementation works correctly.
         // We can't easily test panic behavior in rayon (panics abort by default),
         // but we can verify the guard decrements the counter when it goes out of scope.
+        use crate::metrics::LoomMetrics;
         use std::sync::atomic::Ordering;
 
         let state = super::ComputeTaskState::new();
-        let metrics = crate::mab::RuntimeMetrics::new();
+        let metrics = LoomMetrics::new();
 
         // Create a guard (increments counter)
         {

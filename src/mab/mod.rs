@@ -72,13 +72,11 @@
 
 mod calibration;
 mod knobs;
-mod metrics;
 mod scheduler;
 mod types;
 
 pub use calibration::{calibrate, CalibrationConfig, CalibrationResult};
 pub use knobs::MabKnobs;
-pub use metrics::RuntimeMetrics;
 pub use scheduler::MabScheduler;
 pub use types::{
     Arm, ArmStats, ComputeHint, ComputeHintProvider, Context, DecisionId, FunctionKey, KeyStats,
