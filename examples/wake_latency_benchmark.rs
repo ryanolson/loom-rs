@@ -14,8 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::stream::{self, StreamExt};
-use loom_rs::{ComputeStreamExt, LoomBuilder};
+use loom_rs::LoomBuilder;
 use parking_lot::Mutex;
 
 /// Strategy for handling compute work
@@ -251,22 +250,19 @@ async fn run_strategy(
             }
         }
         Strategy::Adaptive => {
-            // Use adaptive_map which employs MAB scheduling
-            let item_count =
-                (config.phase_duration.as_secs() as usize) * (config.tasks_per_sec as usize);
-            let completed_clone = completed.clone();
+            // Use spawn_adaptive which employs MAB scheduling
+            while Instant::now() < start + config.phase_duration {
+                let task_start = Instant::now();
+                runtime
+                    .spawn_adaptive(move || calibrated_work(work_us))
+                    .await;
+                completed.fetch_add(1, Ordering::Relaxed);
 
-            stream::iter(0..item_count)
-                .adaptive_map(move |_| {
-                    let result = calibrated_work(work_us);
-                    completed_clone.fetch_add(1, Ordering::Relaxed);
-                    result
-                })
-                .for_each(|_| async {
-                    // Small yield to allow probe tasks to run
-                    tokio::task::yield_now().await;
-                })
-                .await;
+                let elapsed = task_start.elapsed();
+                if elapsed < interval {
+                    tokio::time::sleep(interval - elapsed).await;
+                }
+            }
         }
     }
 

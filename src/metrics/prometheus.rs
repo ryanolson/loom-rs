@@ -608,7 +608,10 @@ mod tests {
         let total_spawns = families
             .iter()
             .find(|f| f.get_name() == "loom_total_spawns");
-        assert!(total_spawns.is_some(), "Empty prefix should fallback to 'loom'");
+        assert!(
+            total_spawns.is_some(),
+            "Empty prefix should fallback to 'loom'"
+        );
     }
 
     #[test]
@@ -627,7 +630,10 @@ mod tests {
         let total_spawns = families
             .iter()
             .find(|f| f.get_name() == "my_app_total_spawns");
-        assert!(total_spawns.is_some(), "Hyphens should be converted to underscores");
+        assert!(
+            total_spawns.is_some(),
+            "Hyphens should be converted to underscores"
+        );
     }
 
     #[test]
@@ -645,10 +651,11 @@ mod tests {
 
         let families = registry.gather();
         // "---" becomes "___", then metric becomes "____total_spawns" (prefix + "_" separator)
-        let total_spawns = families
-            .iter()
-            .find(|f| f.get_name() == "____total_spawns");
-        assert!(total_spawns.is_some(), "All-invalid-char prefix should be sanitized to underscores");
+        let total_spawns = families.iter().find(|f| f.get_name() == "____total_spawns");
+        assert!(
+            total_spawns.is_some(),
+            "All-invalid-char prefix should be sanitized to underscores"
+        );
     }
 
     #[test]
