@@ -451,6 +451,9 @@ impl MabScheduler {
 
     /// Update the global prior from learned key stats.
     fn update_global_prior(_knobs: &MabKnobs, global: &mut KeyStats, ks: &KeyStats) {
+        // NOTE: `_knobs` is intentionally kept (and currently unused) so that global
+        // prior updates can be tuned via MabKnobs in the future without changing
+        // this function's signature or its call sites.
         // Simple exponential smoothing of global statistics
         let alpha = 0.01; // Slow update rate for global prior
 
