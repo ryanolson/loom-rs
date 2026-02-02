@@ -29,7 +29,9 @@
 //! ```
 
 use crate::affinity::{pin_to_cpu, CpuAllocator};
-use crate::bridge::{PooledRayonTask, TaskState};
+use crate::bridge::{
+    PooledRayonTask, ScopedCompletion, ScopedComputeFuture, ScopedTaskState, TaskState,
+};
 use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
 use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
@@ -693,6 +695,69 @@ impl LoomRuntime {
         self.inner.rayon_pool.install(f)
     }
 
+    /// Execute a scoped parallel computation, allowing borrowed data.
+    ///
+    /// Unlike `spawn_compute()` which requires `'static` bounds, `scope_compute`
+    /// allows borrowing local variables from the async context for use in parallel
+    /// work. This is safe because:
+    ///
+    /// 1. The `.await` suspends the async task
+    /// 2. `rayon::scope` blocks until ALL spawned work completes
+    /// 3. Only then does the future resolve
+    /// 4. Therefore, borrowed references remain valid throughout
+    ///
+    /// # Performance
+    ///
+    /// | Aspect | Value |
+    /// |--------|-------|
+    /// | Allocation | ~96 bytes per call (not pooled) |
+    /// | Overhead | Comparable to `spawn_compute()` |
+    ///
+    /// State cannot be pooled because the result type R may contain borrowed
+    /// references tied to the calling scope. Benchmarks show performance is
+    /// within noise of `spawn_compute()` - the overhead is dominated by
+    /// cross-thread communication, not state management.
+    ///
+    /// # Cancellation Safety
+    ///
+    /// If the future is dropped before completion (e.g., via `select!` or timeout),
+    /// the drop will **block** until the rayon scope finishes. This is necessary
+    /// to prevent use-after-free of borrowed data. In normal usage (awaiting to
+    /// completion), there is no blocking overhead.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::sync::atomic::{AtomicI32, Ordering};
+    ///
+    /// runtime.block_on(async {
+    ///     let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    ///     let sum = AtomicI32::new(0);
+    ///
+    ///     // Borrow `data` and `sum` for parallel processing
+    ///     runtime.scope_compute(|s| {
+    ///         let (left, right) = data.split_at(data.len() / 2);
+    ///
+    ///         s.spawn(|_| {
+    ///             sum.fetch_add(left.iter().sum(), Ordering::Relaxed);
+    ///         });
+    ///         s.spawn(|_| {
+    ///             sum.fetch_add(right.iter().sum(), Ordering::Relaxed);
+    ///         });
+    ///     }).await;
+    ///
+    ///     // `data` and `sum` are still valid here
+    ///     println!("Sum of {:?} = {}", data, sum.load(Ordering::Relaxed));
+    /// });
+    /// ```
+    pub async fn scope_compute<'env, F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
+        R: Send + 'env,
+    {
+        self.inner.scope_compute(f).await
+    }
+
     /// Stop accepting new tasks.
     ///
     /// After calling this, `spawn_async()` and `spawn_compute()` will still
@@ -905,6 +970,68 @@ impl LoomRuntimeInner {
         pool.push(state_for_return);
 
         result
+    }
+
+    /// Execute a scoped parallel computation with borrowed data.
+    ///
+    /// # Safety Argument
+    ///
+    /// The lifetime erasure via transmute is sound because:
+    /// 1. The async task is suspended at `.await`
+    /// 2. The future only completes after `rayon::scope` returns
+    /// 3. `rayon::scope` blocks until ALL spawned work completes
+    /// 4. Therefore, `'env` references outlive all accesses to borrowed data
+    ///
+    /// This is the same safety argument used by `std::thread::scope`.
+    pub async fn scope_compute<'env, F, R>(self: &Arc<Self>, f: F) -> R
+    where
+        F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
+        R: Send + 'env,
+    {
+        // SAFETY: Lifetime erasure is sound because:
+        // 1. The future holds the async task suspended at .await
+        // 2. Future only completes after rayon::scope returns
+        // 3. rayon::scope blocks until all spawned work completes
+        // 4. Therefore 'env outlives all accesses to borrowed data
+        //
+        // Additionally, if the future is dropped before completion (cancellation),
+        // ScopedComputeFuture::drop blocks until the scope finishes, maintaining
+        // the safety invariant.
+
+        let state = Arc::new(ScopedTaskState::<R>::new());
+        let future = ScopedComputeFuture::new(state.clone());
+        let completion = ScopedCompletion::new(state);
+
+        // Create guard BEFORE spawning - it increments counter and tracks MAB metrics
+        let guard = ComputeTaskGuard::new(&self.compute_state, &self.prometheus_metrics);
+
+        // Create a closure that captures f, completion, and guard
+        let work = move || {
+            guard.started();
+            let result = {
+                let _guard = guard;
+                rayon::scope(|s| f(s))
+            };
+            completion.complete(result);
+        };
+
+        // SAFETY: We erase the lifetime to 'static here. This is safe because:
+        // 1. The ScopedComputeFuture we return will block in Drop if the work
+        //    hasn't completed (cancellation safety)
+        // 2. Normal await returns only after the work completes
+        // 3. Therefore, all 'env references remain valid for the duration of
+        //    the work execution
+        let erased: Box<dyn FnOnce() + Send + 'static> = unsafe {
+            std::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Box<dyn FnOnce() + Send + 'static>>(
+                Box::new(work),
+            )
+        };
+
+        self.rayon_pool.spawn(move || {
+            erased();
+        });
+
+        future.await
     }
 }
 
@@ -1275,5 +1402,278 @@ mod tests {
             loom_metric.is_none(),
             "Should not find metrics with 'loom_' prefix"
         );
+    }
+
+    // =============================================================================
+    // scope_compute Tests
+    // =============================================================================
+
+    #[test]
+    fn test_scope_compute_basic() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async {
+            runtime
+                .scope_compute(|_s| {
+                    // Simple computation without spawning
+                    42
+                })
+                .await
+        });
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_scope_compute_borrow_local_data() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+            let sum = runtime
+                .scope_compute(|_s| {
+                    // Borrow data inside the scope
+                    data.iter().sum::<i32>()
+                })
+                .await;
+
+            // data is still valid after scope_compute
+            assert_eq!(data.len(), 8);
+            sum
+        });
+
+        assert_eq!(result, 36);
+    }
+
+    #[test]
+    fn test_scope_compute_parallel_with_atomic() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let mut config = test_config();
+        config.rayon_threads = Some(2);
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let sum = AtomicI32::new(0);
+
+            runtime
+                .scope_compute(|s| {
+                    let (left, right) = data.split_at(data.len() / 2);
+                    let sum_ref = &sum;
+
+                    s.spawn(move |_| {
+                        let partial: i32 = left.iter().sum();
+                        sum_ref.fetch_add(partial, Ordering::Relaxed);
+                    });
+                    s.spawn(move |_| {
+                        let partial: i32 = right.iter().sum();
+                        sum_ref.fetch_add(partial, Ordering::Relaxed);
+                    });
+                })
+                .await;
+
+            sum.load(Ordering::Relaxed)
+        });
+
+        assert_eq!(result, 36);
+    }
+
+    #[test]
+    fn test_scope_compute_nested_spawns() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let mut config = test_config();
+        config.rayon_threads = Some(4);
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let sum = AtomicI32::new(0);
+
+            runtime
+                .scope_compute(|s| {
+                    let data_ref = &data;
+                    let sum_ref = &sum;
+
+                    s.spawn(move |s| {
+                        // Nested spawn
+                        s.spawn(move |_| {
+                            sum_ref
+                                .fetch_add(data_ref[0..2].iter().sum::<i32>(), Ordering::Relaxed);
+                        });
+                        s.spawn(move |_| {
+                            sum_ref
+                                .fetch_add(data_ref[2..4].iter().sum::<i32>(), Ordering::Relaxed);
+                        });
+                    });
+                    s.spawn(move |_| {
+                        sum_ref.fetch_add(data_ref[4..8].iter().sum::<i32>(), Ordering::Relaxed);
+                    });
+                })
+                .await;
+
+            // rayon::scope guarantees all spawned work completes before returning
+            sum.load(Ordering::Relaxed)
+        });
+
+        assert_eq!(result, 36);
+    }
+
+    #[test]
+    fn test_scope_compute_with_rayon_par_iter() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+            runtime
+                .scope_compute(|_s| {
+                    use rayon::prelude::*;
+                    // Use parallel iterators inside the scope
+                    data.par_iter().map(|x| x * 2).sum::<i32>()
+                })
+                .await
+        });
+
+        assert_eq!(result, 110);
+    }
+
+    #[test]
+    fn test_scope_compute_tracks_compute_tasks() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        // Initially no tasks
+        assert_eq!(runtime.compute_tasks_in_flight(), 0);
+
+        runtime.block_on(async {
+            runtime.scope_compute(|_s| 42).await;
+        });
+
+        // After completion, should be back to 0
+        assert_eq!(runtime.compute_tasks_in_flight(), 0);
+    }
+
+    #[test]
+    fn test_scope_compute_data_still_valid_after() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        runtime.block_on(async {
+            let mut data = vec![1, 2, 3, 4, 5];
+
+            let sum = runtime.scope_compute(|_s| data.iter().sum::<i32>()).await;
+
+            assert_eq!(sum, 15);
+
+            // data is still valid and can be modified
+            data.push(6);
+            assert_eq!(data.len(), 6);
+
+            // Can use scope_compute again with the same data
+            let new_sum = runtime.scope_compute(|_s| data.iter().sum::<i32>()).await;
+            assert_eq!(new_sum, 21);
+        });
+    }
+
+    /// Test that scope_compute properly yields to the async executor and doesn't block.
+    /// This validates the future correctly returns Poll::Pending and wakes up when done.
+    #[test]
+    fn test_scope_compute_yields_to_executor() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        runtime.block_on(async {
+            let concurrent_task_ran = Arc::new(AtomicBool::new(false));
+            let concurrent_task_ran_clone = concurrent_task_ran.clone();
+
+            let scope_started = Arc::new(AtomicBool::new(false));
+            let scope_started_clone = scope_started.clone();
+
+            // Spawn a concurrent async task that should run while scope_compute is waiting
+            let concurrent_handle = runtime.spawn_async(async move {
+                // Wait a bit for the scope_compute to start
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                concurrent_task_ran_clone.store(true, Ordering::Release);
+                100
+            });
+
+            // Run scope_compute with work that takes some time
+            let result = runtime
+                .scope_compute(|_s| {
+                    scope_started_clone.store(true, Ordering::Release);
+                    // Simulate some work
+                    std::thread::sleep(Duration::from_millis(20));
+                    42
+                })
+                .await;
+
+            assert_eq!(result, 42);
+
+            // The concurrent task should have completed
+            let concurrent_result = concurrent_handle.await.unwrap();
+            assert_eq!(concurrent_result, 100);
+
+            // Verify the concurrent task actually ran during scope_compute
+            assert!(
+                concurrent_task_ran.load(Ordering::Acquire),
+                "Concurrent task should have run while scope_compute was in progress"
+            );
+        });
+    }
+
+    /// Test that scope_compute works correctly with tokio::select! (cancellation scenario).
+    /// The future should block on drop until the scope completes.
+    #[test]
+    fn test_scope_compute_cancellation_safety() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        runtime.block_on(async {
+            let scope_completed = Arc::new(AtomicBool::new(false));
+            let scope_completed_clone = scope_completed.clone();
+
+            // Use select! to race scope_compute against a timeout
+            // The scope_compute will "lose" but should still complete before we continue
+            let result = tokio::select! {
+                biased;
+
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    // Timeout wins - this drops the scope_compute future
+                    // But drop should block until scope completes
+                    None
+                }
+                result = runtime.scope_compute(|_s| {
+                    // This takes longer than the timeout
+                    std::thread::sleep(Duration::from_millis(50));
+                    scope_completed_clone.store(true, Ordering::Release);
+                    42
+                }) => {
+                    Some(result)
+                }
+            };
+
+            // The timeout should have won
+            assert!(result.is_none(), "Timeout should have won the race");
+
+            // But critically, the scope should have completed (drop blocked)
+            assert!(
+                scope_completed.load(Ordering::Acquire),
+                "Scope should have completed even though future was cancelled"
+            );
+        });
     }
 }

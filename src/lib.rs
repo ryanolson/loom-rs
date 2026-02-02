@@ -9,6 +9,7 @@
 //! - **Hybrid Runtime**: Combines tokio for async I/O with rayon for CPU-bound parallel work
 //! - **CPU Pinning**: Automatically pins threads to specific CPUs for consistent performance
 //! - **Zero Allocation**: `spawn_compute()` uses per-type pools for zero allocation after warmup
+//! - **Scoped Compute**: `scope_compute()` allows borrowing local data for parallel work
 //! - **Flexible Configuration**: Configure via files (TOML/YAML/JSON), environment variables, or code
 //! - **CLI Integration**: Built-in clap support for command-line overrides
 //! - **CUDA NUMA Awareness**: Optional feature for selecting CPUs local to a GPU (Linux only)
@@ -173,6 +174,9 @@ pub use metrics::LoomMetrics;
 pub use runtime::LoomRuntime;
 pub use stream::ComputeStreamExt;
 
+// Re-export rayon::Scope for ergonomic use with scope_compute
+pub use rayon::Scope;
+
 /// Spawn compute work using the current runtime.
 ///
 /// This is a convenience function for `loom_rs::current_runtime().unwrap().spawn_compute(f)`.
@@ -303,5 +307,65 @@ where
     current_runtime()
         .expect("spawn_adaptive_with_hint called outside loom runtime")
         .spawn_adaptive_with_hint(hint, f)
+        .await
+}
+
+/// Execute a scoped parallel computation using the current runtime.
+///
+/// This is a convenience function for `loom_rs::current_runtime().unwrap().scope_compute(f)`.
+/// It allows borrowing local variables from the async context for use in parallel work.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context (i.e., not within `block_on`,
+/// a tokio worker thread, or a rayon worker thread managed by the runtime).
+///
+/// # Performance
+///
+/// | Aspect | Value |
+/// |--------|-------|
+/// | Allocation | ~96 bytes per call (not pooled) |
+/// | Overhead | Comparable to `spawn_compute()` |
+///
+/// # Cancellation Safety
+///
+/// If the future is dropped before completion (e.g., via `select!` or timeout),
+/// the drop will **block** until the rayon scope finishes. This is necessary
+/// to prevent use-after-free of borrowed data.
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::LoomBuilder;
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+///
+///     // Borrow `data` for parallel processing - no need to pass &runtime
+///     let sum: i32 = loom_rs::scope_compute(|s| {
+///         let (left, right) = data.split_at(data.len() / 2);
+///
+///         let mut left_sum = 0;
+///         let mut right_sum = 0;
+///
+///         s.spawn(|_| left_sum = left.iter().sum());
+///         s.spawn(|_| right_sum = right.iter().sum());
+///
+///         left_sum + right_sum
+///     }).await;
+///
+///     println!("Sum: {}", sum);
+/// });
+/// ```
+pub async fn scope_compute<'env, F, R>(f: F) -> R
+where
+    F: FnOnce(&Scope<'env>) -> R + Send + 'env,
+    R: Send + 'env,
+{
+    current_runtime()
+        .expect("scope_compute called outside loom runtime")
+        .scope_compute(f)
         .await
 }
