@@ -135,6 +135,9 @@ impl LoomMetrics {
     /// The prefix is sanitized to be a valid Prometheus metric name: hyphens and other
     /// invalid characters are replaced with underscores.
     ///
+    /// If the prefix is empty or consists entirely of invalid characters that would
+    /// result in an empty string after sanitization, the default prefix "loom" is used.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -143,11 +146,14 @@ impl LoomMetrics {
     ///
     /// let metrics = LoomMetrics::with_prefix("my-app");
     /// // Creates metrics like: my_app_inflight_tasks, my_app_total_spawns, etc.
+    ///
+    /// let metrics = LoomMetrics::with_prefix("");
+    /// // Falls back to: loom_inflight_tasks, loom_total_spawns, etc.
     /// ```
     pub fn with_prefix(prefix: &str) -> Self {
         // Sanitize prefix for Prometheus: replace invalid chars with underscores
         // Valid chars: [a-zA-Z_:] for first char, [a-zA-Z0-9_:] for rest
-        let prefix: String = prefix
+        let sanitized: String = prefix
             .chars()
             .enumerate()
             .map(|(i, c)| {
@@ -164,6 +170,13 @@ impl LoomMetrics {
                 }
             })
             .collect();
+
+        // Fallback to "loom" if sanitized prefix is empty
+        let prefix = if sanitized.is_empty() {
+            "loom".to_string()
+        } else {
+            sanitized
+        };
 
         let now = Instant::now();
 
@@ -576,6 +589,65 @@ mod tests {
             .iter()
             .find(|f| f.get_name() == "loom_total_spawns");
         assert!(loom_total_spawns.is_none());
+    }
+
+    #[test]
+    fn test_empty_prefix_fallback() {
+        let metrics = LoomMetrics::with_prefix("");
+        let registry = Registry::new();
+
+        metrics
+            .register(&registry)
+            .expect("registration should succeed");
+
+        metrics.inc_total_spawns();
+
+        let families = registry.gather();
+        // Empty prefix should fallback to "loom"
+        let total_spawns = families
+            .iter()
+            .find(|f| f.get_name() == "loom_total_spawns");
+        assert!(total_spawns.is_some(), "Empty prefix should fallback to 'loom'");
+    }
+
+    #[test]
+    fn test_prefix_sanitization() {
+        // Test that hyphens are converted to underscores
+        let metrics = LoomMetrics::with_prefix("my-app");
+        let registry = Registry::new();
+
+        metrics
+            .register(&registry)
+            .expect("registration should succeed");
+
+        metrics.inc_total_spawns();
+
+        let families = registry.gather();
+        let total_spawns = families
+            .iter()
+            .find(|f| f.get_name() == "my_app_total_spawns");
+        assert!(total_spawns.is_some(), "Hyphens should be converted to underscores");
+    }
+
+    #[test]
+    fn test_all_invalid_chars_prefix() {
+        // Prefix with only invalid characters (after first char sanitization)
+        // Since first char becomes '_' and rest are invalid, we get a prefix
+        let metrics = LoomMetrics::with_prefix("---");
+        let registry = Registry::new();
+
+        metrics
+            .register(&registry)
+            .expect("registration should succeed");
+
+        metrics.inc_total_spawns();
+
+        let families = registry.gather();
+        // "---" becomes "___"
+        let total_spawns = families
+            .iter()
+            .find(|f| f.get_name() == "____total_spawns");
+        assert!(total_spawns.is_some(), "All-invalid-char prefix should be sanitized to underscores");
     }
 
     #[test]
