@@ -226,7 +226,16 @@ pub(crate) struct LoomRuntimeInner {
 impl LoomRuntime {
     /// Create a LoomRuntime from an existing inner reference.
     ///
-    /// Used by `current_runtime()` to wrap the thread-local inner.
+    /// This does **not** create a new runtime; it only creates another
+    /// handle that points at the same `LoomRuntimeInner`. As a result,
+    /// multiple `LoomRuntime` values may refer to the same underlying
+    /// runtime state.
+    ///
+    /// This is intended for internal use by `current_runtime()` to wrap the
+    /// thread-local inner reference. Callers must **not** treat the returned
+    /// handle as an independently owned runtime for the purpose of shutdown
+    /// or teardown. Invoking shutdown-related methods from multiple wrappers
+    /// that share the same inner state may lead to unexpected behavior.
     pub(crate) fn from_inner(inner: Arc<LoomRuntimeInner>) -> Self {
         Self { inner }
     }
