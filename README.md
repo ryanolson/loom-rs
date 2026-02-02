@@ -11,6 +11,7 @@ A Rust crate providing a bespoke thread pool runtime combining tokio and rayon w
 - **Flexible Configuration**: Configure via files (TOML/YAML/JSON), environment variables, or code
 - **CLI Integration**: Built-in clap support for command-line overrides
 - **CUDA NUMA Awareness**: Optional feature for selecting CPUs local to a GPU (Linux only)
+- **Adaptive Scheduling**: [MAB-based scheduler](docs/mab.md) learns optimal inline vs offload decisions
 
 ## Platform Support
 
@@ -24,18 +25,14 @@ A Rust crate providing a bespoke thread pool runtime combining tokio and rayon w
 
 ## Installation
 
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-loom-rs = "0.1"
+```bash
+cargo add loom-rs
 ```
 
 For CUDA support (Linux only):
 
-```toml
-[dependencies]
-loom-rs = { version = "0.1", features = ["cuda"] }
+```bash
+cargo add loom-rs --features cuda
 ```
 
 ## Quick Start
@@ -188,8 +185,10 @@ Threads are named with the configured prefix:
 | Method | Use Case | Overhead | Tracked |
 |--------|----------|----------|---------|
 | `spawn_async()` | I/O-bound async tasks | ~10ns | Yes |
-| `spawn_compute()` | CPU-bound work (await from async) | ~100-500ns | Yes |
-| `compute_map()` | Stream items -> rayon -> stream | ~100-500ns/item | No |
+| `spawn_compute()` | CPU-bound work (always offload) | ~100-500ns | Yes |
+| `spawn_adaptive()` | CPU work (MAB decides inline/offload) | ~50-200ns | Yes |
+| `compute_map()` | Stream -> rayon -> stream | ~100-500ns/item | No |
+| `adaptive_map()` | Stream with MAB decisions | ~50-200ns/item | No |
 | `install()` | Zero-overhead parallel iterators | ~0ns | No |
 
 ### Shutdown
@@ -278,6 +277,40 @@ This is ideal for pipelines where you:
 3. Continue the async pipeline with the results
 
 Items are processed sequentially to preserve ordering and provide natural backpressure.
+
+## Adaptive Scheduling (MAB)
+
+loom-rs includes a Multi-Armed Bandit (MAB) scheduler that learns whether to run
+compute work inline on Tokio or offload to Rayon. This eliminates the need to
+manually tune offload decisions - the scheduler adapts to your actual workload.
+
+### Stream Mode
+
+```rust
+use loom_rs::ComputeStreamExt;
+
+// MAB learns optimal strategy per-closure
+let results: Vec<_> = stream
+    .adaptive_map(|item| process(item))
+    .collect()
+    .await;
+```
+
+### One-Shot Mode
+
+```rust
+// For request handlers - MAB adapts per function type
+let result = runtime.spawn_adaptive(|| handle_request(data)).await;
+```
+
+### Key Features
+
+- **Thompson Sampling**: Balances exploration vs exploitation
+- **Guardrails**: 4 layers of Tokio starvation protection (GR0-GR3)
+- **Pressure-Aware**: Adjusts decisions based on runtime load
+- **Low Overhead**: ~50-200ns per decision
+
+See [docs/mab.md](docs/mab.md) for the complete design and configuration options.
 
 ## Performance
 

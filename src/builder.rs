@@ -9,10 +9,12 @@
 
 use crate::config::LoomConfig;
 use crate::error::Result;
+use crate::mab::{CalibrationConfig, MabKnobs};
 use crate::runtime::LoomRuntime;
 
 use figment::providers::{Env, Format, Json, Serialized, Toml, Yaml};
 use figment::Figment;
+use prometheus::Registry;
 use std::path::Path;
 
 #[cfg(feature = "cuda")]
@@ -38,9 +40,9 @@ use crate::cuda::CudaDeviceSelector;
 ///     .tokio_threads(2)
 ///     .build()?;
 /// ```
-#[derive(Debug)]
 pub struct LoomBuilder {
     figment: Figment,
+    prometheus_registry: Option<Registry>,
 }
 
 impl Default for LoomBuilder {
@@ -49,11 +51,24 @@ impl Default for LoomBuilder {
     }
 }
 
+impl std::fmt::Debug for LoomBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoomBuilder")
+            .field("figment", &self.figment)
+            .field(
+                "prometheus_registry",
+                &self.prometheus_registry.as_ref().map(|_| "<Registry>"),
+            )
+            .finish()
+    }
+}
+
 impl LoomBuilder {
     /// Create a new builder with default configuration.
     pub fn new() -> Self {
         Self {
             figment: Figment::from(Serialized::defaults(LoomConfig::default())),
+            prometheus_registry: None,
         }
     }
 
@@ -171,6 +186,99 @@ impl LoomBuilder {
         self
     }
 
+    /// Set the MAB scheduler knobs.
+    ///
+    /// These control the adaptive scheduling decisions. Most users don't need
+    /// to modify these. See [`MabKnobs`] for details.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use loom_rs::{LoomBuilder, MabKnobs};
+    ///
+    /// let runtime = LoomBuilder::new()
+    ///     .mab_knobs(MabKnobs::default().with_k_starve(0.2))
+    ///     .build()?;
+    /// ```
+    pub fn mab_knobs(mut self, knobs: MabKnobs) -> Self {
+        self.figment = self.figment.merge(Serialized::default("mab_knobs", knobs));
+        self
+    }
+
+    /// Enable calibration at runtime startup.
+    ///
+    /// Calibration measures the overhead of offloading work to rayon,
+    /// which helps the MAB make better decisions for borderline workloads.
+    ///
+    /// Default: disabled (for fast unit test startup).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let runtime = LoomBuilder::new()
+    ///     .calibrate(true)
+    ///     .build()?;
+    /// ```
+    pub fn calibrate(mut self, enabled: bool) -> Self {
+        let config = CalibrationConfig {
+            enabled,
+            ..Default::default()
+        };
+        self.figment = self
+            .figment
+            .merge(Serialized::default("calibration", config));
+        self
+    }
+
+    /// Set calibration configuration.
+    ///
+    /// Allows full control over calibration parameters.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use loom_rs::mab::CalibrationConfig;
+    ///
+    /// let runtime = LoomBuilder::new()
+    ///     .calibration_config(
+    ///         CalibrationConfig::new()
+    ///             .enabled()
+    ///             .sample_count(500)
+    ///     )
+    ///     .build()?;
+    /// ```
+    pub fn calibration_config(mut self, config: CalibrationConfig) -> Self {
+        self.figment = self
+            .figment
+            .merge(Serialized::default("calibration", config));
+        self
+    }
+
+    /// Provide an external Prometheus registry for metrics exposition.
+    ///
+    /// When a registry is provided, loom runtime metrics will be registered
+    /// and available for Prometheus scraping.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use prometheus::Registry;
+    ///
+    /// let registry = Registry::new();
+    /// let runtime = LoomBuilder::new()
+    ///     .prometheus_registry(registry.clone())
+    ///     .build()?;
+    ///
+    /// // Later: expose via HTTP endpoint
+    /// let encoder = prometheus::TextEncoder::new();
+    /// let metric_families = registry.gather();
+    /// // encoder.encode(&metric_families, &mut buffer)?;
+    /// ```
+    pub fn prometheus_registry(mut self, registry: Registry) -> Self {
+        self.prometheus_registry = Some(registry);
+        self
+    }
+
     /// Set the CUDA device by ID.
     ///
     /// This will configure the runtime to use CPUs local to the specified
@@ -251,7 +359,8 @@ impl LoomBuilder {
     /// - CPU set is invalid or contains unavailable CPUs
     /// - Runtime construction fails
     pub fn build(self) -> Result<LoomRuntime> {
-        let config: LoomConfig = self.figment.extract().map_err(Box::new)?;
+        let mut config: LoomConfig = self.figment.extract().map_err(Box::new)?;
+        config.prometheus_registry = self.prometheus_registry;
         let pool_size = config.compute_pool_size;
         LoomRuntime::from_config(config, pool_size)
     }

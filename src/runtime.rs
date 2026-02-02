@@ -34,11 +34,14 @@ use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
 use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
 use crate::error::{LoomError, Result};
+use crate::mab::{Arm, ComputeHint, Context, FunctionKey, MabKnobs, MabScheduler};
+use crate::metrics::LoomMetrics;
 use crate::pool::ComputePoolRegistry;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Instant;
 use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
@@ -63,7 +66,27 @@ impl ComputeTaskState {
     }
 }
 
-/// Guard that decrements compute task counter on drop.
+/// Guard for tracking async task metrics.
+///
+/// Panic-safe: task_completed is called even if the future panics.
+struct AsyncMetricsGuard {
+    inner: Arc<LoomRuntimeInner>,
+}
+
+impl AsyncMetricsGuard {
+    fn new(inner: Arc<LoomRuntimeInner>) -> Self {
+        inner.prometheus_metrics.task_started();
+        Self { inner }
+    }
+}
+
+impl Drop for AsyncMetricsGuard {
+    fn drop(&mut self) {
+        self.inner.prometheus_metrics.task_completed();
+    }
+}
+
+/// Guard for tracking compute task state and metrics.
 ///
 /// Panic-safe: executes even if the task closure panics.
 ///
@@ -71,23 +94,42 @@ impl ComputeTaskState {
 /// because block_until_idle waits for compute_tasks to reach 0.
 struct ComputeTaskGuard {
     state: *const ComputeTaskState,
+    metrics: *const LoomMetrics,
 }
 
 unsafe impl Send for ComputeTaskGuard {}
 
 impl ComputeTaskGuard {
-    fn new(state: &ComputeTaskState) -> Self {
+    /// Create a new guard, tracking submission in MAB metrics.
+    ///
+    /// This should be called BEFORE spawning on rayon.
+    fn new(state: &ComputeTaskState, metrics: &LoomMetrics) -> Self {
         state.count.fetch_add(1, Ordering::Relaxed);
+        metrics.rayon_submitted();
         Self {
             state: state as *const ComputeTaskState,
+            metrics: metrics as *const LoomMetrics,
+        }
+    }
+
+    /// Mark that the rayon task has started executing.
+    ///
+    /// This should be called at the START of the rayon closure.
+    fn started(&self) {
+        // SAFETY: metrics outlives rayon tasks
+        unsafe {
+            (*self.metrics).rayon_started();
         }
     }
 }
 
 impl Drop for ComputeTaskGuard {
     fn drop(&mut self) {
-        // SAFETY: state outlives rayon tasks due to shutdown waiting
+        // SAFETY: state and metrics outlive rayon tasks due to shutdown waiting
         unsafe {
+            // Track MAB metrics completion (panic-safe)
+            (*self.metrics).rayon_completed();
+
             let prev = (*self.state).count.fetch_sub(1, Ordering::Release);
             if prev == 1 {
                 // Count just went from 1 to 0, notify waiters
@@ -148,14 +190,14 @@ impl Drop for ComputeTaskGuard {
 /// runtime.block_until_idle();
 /// ```
 pub struct LoomRuntime {
-    inner: Arc<LoomRuntimeInner>,
+    pub(crate) inner: Arc<LoomRuntimeInner>,
 }
 
 /// Inner state shared with thread-locals.
 ///
 /// This is Arc-wrapped and shared with tokio/rayon worker threads via thread-local
 /// storage, enabling `current_runtime()` to work from any managed thread.
-pub struct LoomRuntimeInner {
+pub(crate) struct LoomRuntimeInner {
     config: LoomConfig,
     tokio_runtime: tokio::runtime::Runtime,
     pub(crate) rayon_pool: rayon::ThreadPool,
@@ -165,32 +207,76 @@ pub struct LoomRuntimeInner {
     /// Per-type object pools for zero-allocation spawn_compute
     pub(crate) pools: ComputePoolRegistry,
     /// Number of tokio worker threads
-    tokio_threads: usize,
+    pub(crate) tokio_threads: usize,
     /// Number of rayon worker threads
-    rayon_threads: usize,
+    pub(crate) rayon_threads: usize,
     /// CPUs allocated to tokio workers
-    tokio_cpus: Vec<usize>,
+    pub(crate) tokio_cpus: Vec<usize>,
     /// CPUs allocated to rayon workers
-    rayon_cpus: Vec<usize>,
+    pub(crate) rayon_cpus: Vec<usize>,
+    /// Lazily initialized shared MAB scheduler
+    mab_scheduler: OnceLock<Arc<MabScheduler>>,
+    /// MAB knobs configuration
+    pub(crate) mab_knobs: MabKnobs,
+    /// Prometheus metrics - single source of truth for all metrics
+    /// (serves both Prometheus exposition and MAB scheduling)
+    pub(crate) prometheus_metrics: LoomMetrics,
 }
 
 impl LoomRuntime {
+    /// Create a LoomRuntime from an existing inner reference.
+    ///
+    /// This does **not** create a new runtime; it only creates another
+    /// handle that points at the same `LoomRuntimeInner`. As a result,
+    /// multiple `LoomRuntime` values may refer to the same underlying
+    /// runtime state.
+    ///
+    /// This is intended for internal use by `current_runtime()` to wrap the
+    /// thread-local inner reference. Callers must **not** treat the returned
+    /// handle as an independently owned runtime for the purpose of shutdown
+    /// or teardown. Invoking shutdown-related methods from multiple wrappers
+    /// that share the same inner state may lead to unexpected behavior.
+    pub(crate) fn from_inner(inner: Arc<LoomRuntimeInner>) -> Self {
+        Self { inner }
+    }
+
     /// Create a runtime from a configuration.
     ///
     /// This is typically called via `LoomBuilder::build()`.
     pub(crate) fn from_config(config: LoomConfig, pool_size: usize) -> Result<Self> {
         // Determine available CPUs
-        let cpus = if let Some(ref cpuset_str) = config.cpuset {
-            parse_and_validate_cpuset(cpuset_str)?
-        } else {
+        // Priority: CUDA device cpuset > user cpuset > all available CPUs
+        // Error if both cuda_device and cpuset are specified (mutually exclusive)
+        let cpus = {
             #[cfg(feature = "cuda")]
-            if let Some(ref selector) = config.cuda_device {
-                crate::cuda::cpuset_for_cuda_device(selector)?
-            } else {
-                available_cpus()
+            {
+                // Check for conflicting configuration first
+                if config.cuda_device.is_some() && config.cpuset.is_some() {
+                    return Err(LoomError::CudaCpusetConflict);
+                }
+
+                if let Some(ref selector) = config.cuda_device {
+                    match crate::cuda::cpuset_for_cuda_device(selector)? {
+                        Some(cuda_cpus) => cuda_cpus,
+                        None => {
+                            // Could not determine CUDA locality, fall back to all CPUs
+                            available_cpus()
+                        }
+                    }
+                } else if let Some(ref cpuset_str) = config.cpuset {
+                    parse_and_validate_cpuset(cpuset_str)?
+                } else {
+                    available_cpus()
+                }
             }
             #[cfg(not(feature = "cuda"))]
-            available_cpus()
+            {
+                if let Some(ref cpuset_str) = config.cpuset {
+                    parse_and_validate_cpuset(cpuset_str)?
+                } else {
+                    available_cpus()
+                }
+            }
         };
 
         if cpus.is_empty() {
@@ -251,6 +337,19 @@ impl LoomRuntime {
                 Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus.clone(), weak_clone)
                     .expect("failed to build rayon pool");
 
+            // Extract MAB knobs, using defaults if not configured
+            let mab_knobs = config.mab_knobs.clone().unwrap_or_default();
+
+            // Create Prometheus metrics with the runtime's prefix
+            let prometheus_metrics = LoomMetrics::with_prefix(&config.prefix);
+
+            // Register with provided registry if available
+            if let Some(ref registry) = config.prometheus_registry {
+                if let Err(e) = prometheus_metrics.register(registry) {
+                    warn!(%e, "failed to register prometheus metrics");
+                }
+            }
+
             LoomRuntimeInner {
                 config,
                 tokio_runtime,
@@ -262,6 +361,9 @@ impl LoomRuntime {
                 rayon_threads,
                 tokio_cpus,
                 rayon_cpus,
+                mab_scheduler: OnceLock::new(),
+                mab_knobs,
+                prometheus_metrics,
             }
         });
 
@@ -432,9 +534,12 @@ impl LoomRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // Track task for MAB metrics (panic-safe via guard)
+        let metrics_guard = AsyncMetricsGuard::new(Arc::clone(&self.inner));
         let token = self.inner.task_tracker.token();
         self.inner.tokio_runtime.spawn(async move {
-            let _guard = token;
+            let _tracker = token;
+            let _metrics = metrics_guard;
             future.await
         })
     }
@@ -472,6 +577,88 @@ impl LoomRuntime {
         R: Send + 'static,
     {
         self.inner.spawn_compute(f).await
+    }
+
+    /// Spawn work with adaptive inline/offload decision.
+    ///
+    /// Uses MAB (Multi-Armed Bandit) to learn whether this function type should
+    /// run inline on tokio or offload to rayon. Good for handler patterns where
+    /// work duration varies by input.
+    ///
+    /// Unlike `spawn_compute()` which always offloads, this adaptively chooses
+    /// based on learned behavior and current system pressure.
+    ///
+    /// # Performance
+    ///
+    /// | Scenario | Behavior | Overhead |
+    /// |----------|----------|----------|
+    /// | Fast work | Inlines after learning | ~100ns (decision only) |
+    /// | Slow work | Offloads after learning | ~100-500ns (+ offload) |
+    /// | Cold start | Explores both arms | Variable |
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// runtime.block_on(async {
+    ///     // MAB will learn whether this is fast or slow
+    ///     let result = runtime.spawn_adaptive(|| {
+    ///         process_item(item)
+    ///     }).await;
+    /// });
+    /// ```
+    pub async fn spawn_adaptive<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.spawn_adaptive_with_hint(ComputeHint::Unknown, f).await
+    }
+
+    /// Spawn with hint for cold-start guidance.
+    ///
+    /// The hint helps the scheduler make better initial decisions before it has
+    /// learned the actual execution time of this function type.
+    ///
+    /// # Hints
+    ///
+    /// - `ComputeHint::Low` - Expected < 50µs (likely inline-safe)
+    /// - `ComputeHint::Medium` - Expected 50-500µs (borderline)
+    /// - `ComputeHint::High` - Expected > 500µs (should test offload early)
+    /// - `ComputeHint::Unknown` - No hint (default exploration)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use loom_rs::ComputeHint;
+    ///
+    /// runtime.block_on(async {
+    ///     // Hint that this is likely slow work
+    ///     let result = runtime.spawn_adaptive_with_hint(
+    ///         ComputeHint::High,
+    ///         || expensive_computation()
+    ///     ).await;
+    /// });
+    /// ```
+    pub async fn spawn_adaptive_with_hint<F, R>(&self, hint: ComputeHint, f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let ctx = self.collect_context();
+        let key = FunctionKey::from_type::<F>();
+        let scheduler = self.mab_scheduler();
+
+        let (id, arm) = scheduler.choose_with_hint(key, &ctx, hint);
+        let start = Instant::now();
+
+        let result = match arm {
+            Arm::InlineTokio => f(),
+            Arm::OffloadRayon => self.inner.spawn_compute(f).await,
+        };
+
+        let elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+        scheduler.finish(id, elapsed_us, Some(elapsed_us));
+        result
     }
 
     /// Execute work on rayon with zero overhead (sync, blocking).
@@ -600,6 +787,81 @@ impl LoomRuntime {
         self.shutdown();
         self.block_on(self.wait_for_shutdown());
     }
+
+    /// Get the shared MAB scheduler for handler patterns.
+    ///
+    /// The scheduler is lazily initialized on first call. Use this when you
+    /// need to make manual scheduling decisions in handler code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use loom_rs::mab::{FunctionKey, Arm};
+    ///
+    /// let sched = runtime.mab_scheduler();
+    /// let key = FunctionKey::from_type::<MyHandler>();
+    /// let ctx = runtime.collect_context();
+    ///
+    /// let (id, arm) = sched.choose(key, &ctx);
+    /// let result = match arm {
+    ///     Arm::InlineTokio => my_work(),
+    ///     Arm::OffloadRayon => runtime.block_on(async {
+    ///         runtime.spawn_compute(|| my_work()).await
+    ///     }),
+    /// };
+    /// sched.finish(id, elapsed_us, Some(fn_us));
+    /// ```
+    pub fn mab_scheduler(&self) -> Arc<MabScheduler> {
+        self.inner
+            .mab_scheduler
+            .get_or_init(|| {
+                Arc::new(MabScheduler::with_metrics(
+                    self.inner.mab_knobs.clone(),
+                    self.inner.prometheus_metrics.clone(),
+                ))
+            })
+            .clone()
+    }
+
+    /// Collect current runtime context for MAB scheduling decisions.
+    ///
+    /// Returns a snapshot of current metrics including inflight tasks,
+    /// spawn rate, and queue depth.
+    pub fn collect_context(&self) -> Context {
+        self.inner.prometheus_metrics.collect_context(
+            self.inner.tokio_threads as u32,
+            self.inner.rayon_threads as u32,
+        )
+    }
+
+    /// Get the number of tokio worker threads.
+    pub fn tokio_threads(&self) -> usize {
+        self.inner.tokio_threads
+    }
+
+    /// Get the number of rayon threads.
+    pub fn rayon_threads(&self) -> usize {
+        self.inner.rayon_threads
+    }
+
+    /// Get the Prometheus metrics.
+    ///
+    /// The metrics are always collected (zero overhead atomic operations).
+    /// If a Prometheus registry was provided via `LoomBuilder::prometheus_registry()`,
+    /// the metrics are also registered for exposition.
+    pub fn prometheus_metrics(&self) -> &LoomMetrics {
+        &self.inner.prometheus_metrics
+    }
+
+    /// Get the CPUs allocated to tokio workers.
+    pub fn tokio_cpus(&self) -> &[usize] {
+        &self.inner.tokio_cpus
+    }
+
+    /// Get the CPUs allocated to rayon workers.
+    pub fn rayon_cpus(&self) -> &[usize] {
+        &self.inner.rayon_cpus
+    }
 }
 
 impl LoomRuntimeInner {
@@ -607,7 +869,7 @@ impl LoomRuntimeInner {
     ///
     /// Uses per-type object pools for zero allocation after warmup.
     #[inline]
-    pub async fn spawn_compute<F, R>(&self, f: F) -> R
+    pub async fn spawn_compute<F, R>(self: &Arc<Self>, f: F) -> R
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -620,10 +882,13 @@ impl LoomRuntimeInner {
         // Create the pooled task
         let (task, completion, state_for_return) = PooledRayonTask::new(state);
 
-        // Create guard BEFORE spawning - it increments counter in constructor
-        let guard = ComputeTaskGuard::new(&self.compute_state);
+        // Create guard BEFORE spawning - it increments counter and tracks MAB metrics
+        let guard = ComputeTaskGuard::new(&self.compute_state, &self.prometheus_metrics);
 
         self.rayon_pool.spawn(move || {
+            // Track rayon task start for queue depth calculation
+            guard.started();
+
             // Execute work inside guard scope so counter decrements BEFORE completing.
             // This ensures the async future sees count=0 when it wakes up.
             let result = {
@@ -683,6 +948,9 @@ mod tests {
             compute_pool_size: DEFAULT_POOL_SIZE,
             #[cfg(feature = "cuda")]
             cuda_device: None,
+            mab_knobs: None,
+            calibration: None,
+            prometheus_registry: None,
         }
     }
 
@@ -814,13 +1082,15 @@ mod tests {
         // This test verifies the guard's Drop implementation works correctly.
         // We can't easily test panic behavior in rayon (panics abort by default),
         // but we can verify the guard decrements the counter when it goes out of scope.
+        use crate::metrics::LoomMetrics;
         use std::sync::atomic::Ordering;
 
         let state = super::ComputeTaskState::new();
+        let metrics = LoomMetrics::new();
 
         // Create a guard (increments counter)
         {
-            let _guard = super::ComputeTaskGuard::new(&state);
+            let _guard = super::ComputeTaskGuard::new(&state, &metrics);
             assert_eq!(state.count.load(Ordering::Relaxed), 1);
         }
         // Guard dropped, counter should be 0
@@ -829,10 +1099,10 @@ mod tests {
         // Test multiple guards
         let state = super::ComputeTaskState::new();
 
-        let guard1 = super::ComputeTaskGuard::new(&state);
+        let guard1 = super::ComputeTaskGuard::new(&state, &metrics);
         assert_eq!(state.count.load(Ordering::Relaxed), 1);
 
-        let guard2 = super::ComputeTaskGuard::new(&state);
+        let guard2 = super::ComputeTaskGuard::new(&state, &metrics);
         assert_eq!(state.count.load(Ordering::Relaxed), 2);
 
         drop(guard1);
@@ -869,5 +1139,141 @@ mod tests {
         assert!(display.starts_with("LoomRuntime[test]:"));
         assert!(display.contains("tokio(1, cpus="));
         assert!(display.contains("rayon(1, cpus="));
+    }
+
+    #[test]
+    fn test_cpuset_only() {
+        let mut config = test_config();
+        config.cpuset = Some("0".to_string());
+        config.tokio_threads = Some(1);
+        config.rayon_threads = Some(0);
+
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        // Should use the user-provided cpuset
+        assert_eq!(runtime.inner.tokio_cpus, vec![0]);
+    }
+
+    /// Test that CUDA cpuset conflict error is properly detected.
+    /// This test requires actual CUDA hardware to verify the conflict.
+    #[cfg(feature = "cuda-tests")]
+    #[test]
+    fn test_cuda_cpuset_conflict_error() {
+        let mut config = test_config();
+        config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
+        config.cpuset = Some("0".to_string()); // Conflict: both specified
+
+        let result = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE);
+        assert!(
+            matches!(result, Err(LoomError::CudaCpusetConflict)),
+            "expected CudaCpusetConflict error, got {:?}",
+            result
+        );
+    }
+
+    /// Test that CUDA device alone (without cpuset) works.
+    #[cfg(feature = "cuda-tests")]
+    #[test]
+    fn test_cuda_device_only() {
+        let mut config = test_config();
+        config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
+        config.cpuset = None;
+
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        // Should have found CUDA-local CPUs
+        assert!(!runtime.inner.tokio_cpus.is_empty());
+    }
+
+    // =============================================================================
+    // spawn_adaptive Tests
+    // =============================================================================
+
+    #[test]
+    fn test_spawn_adaptive_runs_work() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async { runtime.spawn_adaptive(|| 42).await });
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_spawn_adaptive_with_hint() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async {
+            runtime
+                .spawn_adaptive_with_hint(crate::ComputeHint::Low, || 100)
+                .await
+        });
+
+        assert_eq!(result, 100);
+    }
+
+    #[test]
+    fn test_spawn_adaptive_multiple_calls() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        runtime.block_on(async {
+            // Run many fast tasks to let MAB learn
+            for i in 0..50 {
+                let result = runtime.spawn_adaptive(move || i * 2).await;
+                assert_eq!(result, i * 2);
+            }
+        });
+    }
+
+    #[test]
+    fn test_spawn_adaptive_records_metrics() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        runtime.block_on(async {
+            // Run some adaptive tasks
+            for _ in 0..10 {
+                runtime.spawn_adaptive(|| std::hint::black_box(42)).await;
+            }
+        });
+
+        // Check that metrics were recorded
+        let metrics = runtime.prometheus_metrics();
+        let total_decisions = metrics.inline_decisions.get() + metrics.offload_decisions.get();
+        assert!(
+            total_decisions >= 10,
+            "Should have recorded at least 10 decisions, got {}",
+            total_decisions
+        );
+    }
+
+    #[test]
+    fn test_prometheus_metrics_use_prefix() {
+        let mut config = test_config();
+        config.prefix = "myapp".to_string();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        // The metrics should use the prefix from config
+        // We can verify by checking the registry if one was provided
+        let registry = prometheus::Registry::new();
+        runtime
+            .prometheus_metrics()
+            .register(&registry)
+            .expect("registration should succeed");
+
+        let families = registry.gather();
+        // Find a metric with our prefix
+        let myapp_metric = families.iter().find(|f| f.get_name().starts_with("myapp_"));
+        assert!(
+            myapp_metric.is_some(),
+            "Should find metrics with 'myapp_' prefix"
+        );
+
+        // Should not find metrics with default 'loom_' prefix
+        let loom_metric = families.iter().find(|f| f.get_name().starts_with("loom_"));
+        assert!(
+            loom_metric.is_none(),
+            "Should not find metrics with 'loom_' prefix"
+        );
     }
 }

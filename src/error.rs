@@ -46,6 +46,11 @@ pub enum LoomError {
     /// Thread count mismatch - not enough CPUs for requested threads.
     #[error("requested {requested} threads but only {available} CPUs available")]
     InsufficientCpus { requested: usize, available: usize },
+
+    /// Cannot specify both cuda_device and cpuset.
+    #[cfg(feature = "cuda")]
+    #[error("cannot specify both cuda_device and cpuset; cuda_device implies its local cpuset")]
+    CudaCpusetConflict,
 }
 
 /// Result type alias for Loom operations.

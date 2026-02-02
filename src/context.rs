@@ -20,9 +20,9 @@
 //! ```
 
 use std::cell::RefCell;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
-use crate::runtime::LoomRuntimeInner;
+use crate::runtime::{LoomRuntime, LoomRuntimeInner};
 
 thread_local! {
     static CURRENT_RUNTIME: RefCell<Option<Weak<LoomRuntimeInner>>> = const { RefCell::new(None) };
@@ -44,8 +44,13 @@ thread_local! {
 ///     rt.spawn_compute(|| work()).await;
 /// });
 /// ```
-pub fn current_runtime() -> Option<Arc<LoomRuntimeInner>> {
-    CURRENT_RUNTIME.with(|rt| rt.borrow().as_ref().and_then(|weak| weak.upgrade()))
+pub fn current_runtime() -> Option<LoomRuntime> {
+    CURRENT_RUNTIME.with(|rt| {
+        rt.borrow()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .map(LoomRuntime::from_inner)
+    })
 }
 
 /// Set the current runtime for this thread.
