@@ -34,13 +34,14 @@ use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
 use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
 use crate::error::{LoomError, Result};
-use crate::mab::{Context, MabKnobs, MabScheduler, RuntimeMetrics};
+use crate::mab::{Arm, ComputeHint, Context, FunctionKey, MabKnobs, MabScheduler, RuntimeMetrics};
 use crate::metrics::LoomMetrics;
 use crate::pool::ComputePoolRegistry;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::Instant;
 use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
@@ -338,8 +339,8 @@ impl LoomRuntime {
             // Extract MAB knobs, using defaults if not configured
             let mab_knobs = config.mab_knobs.clone().unwrap_or_default();
 
-            // Create Prometheus metrics
-            let prometheus_metrics = LoomMetrics::new();
+            // Create Prometheus metrics with the runtime's prefix
+            let prometheus_metrics = LoomMetrics::with_prefix(&config.prefix);
 
             // Register with provided registry if available
             if let Some(ref registry) = config.prometheus_registry {
@@ -578,6 +579,88 @@ impl LoomRuntime {
         self.inner.spawn_compute(f).await
     }
 
+    /// Spawn work with adaptive inline/offload decision.
+    ///
+    /// Uses MAB (Multi-Armed Bandit) to learn whether this function type should
+    /// run inline on tokio or offload to rayon. Good for handler patterns where
+    /// work duration varies by input.
+    ///
+    /// Unlike `spawn_compute()` which always offloads, this adaptively chooses
+    /// based on learned behavior and current system pressure.
+    ///
+    /// # Performance
+    ///
+    /// | Scenario | Behavior | Overhead |
+    /// |----------|----------|----------|
+    /// | Fast work | Inlines after learning | ~100ns (decision only) |
+    /// | Slow work | Offloads after learning | ~100-500ns (+ offload) |
+    /// | Cold start | Explores both arms | Variable |
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// runtime.block_on(async {
+    ///     // MAB will learn whether this is fast or slow
+    ///     let result = runtime.spawn_adaptive(|| {
+    ///         process_item(item)
+    ///     }).await;
+    /// });
+    /// ```
+    pub async fn spawn_adaptive<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.spawn_adaptive_with_hint(ComputeHint::Unknown, f).await
+    }
+
+    /// Spawn with hint for cold-start guidance.
+    ///
+    /// The hint helps the scheduler make better initial decisions before it has
+    /// learned the actual execution time of this function type.
+    ///
+    /// # Hints
+    ///
+    /// - `ComputeHint::Low` - Expected < 50µs (likely inline-safe)
+    /// - `ComputeHint::Medium` - Expected 50-500µs (borderline)
+    /// - `ComputeHint::High` - Expected > 500µs (should test offload early)
+    /// - `ComputeHint::Unknown` - No hint (default exploration)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use loom_rs::ComputeHint;
+    ///
+    /// runtime.block_on(async {
+    ///     // Hint that this is likely slow work
+    ///     let result = runtime.spawn_adaptive_with_hint(
+    ///         ComputeHint::High,
+    ///         || expensive_computation()
+    ///     ).await;
+    /// });
+    /// ```
+    pub async fn spawn_adaptive_with_hint<F, R>(&self, hint: ComputeHint, f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let ctx = self.collect_context();
+        let key = FunctionKey::from_type::<F>();
+        let scheduler = self.mab_scheduler();
+
+        let (id, arm) = scheduler.choose_with_hint(key, &ctx, hint);
+        let start = Instant::now();
+
+        let result = match arm {
+            Arm::InlineTokio => f(),
+            Arm::OffloadRayon => self.inner.spawn_compute(f).await,
+        };
+
+        let elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+        scheduler.finish(id, elapsed_us, Some(elapsed_us));
+        result
+    }
+
     /// Execute work on rayon with zero overhead (sync, blocking).
     ///
     /// This installs the rayon pool for the current scope, allowing direct use
@@ -731,7 +814,12 @@ impl LoomRuntime {
     pub fn mab_scheduler(&self) -> Arc<MabScheduler> {
         self.inner
             .mab_scheduler
-            .get_or_init(|| Arc::new(MabScheduler::new(self.inner.mab_knobs.clone())))
+            .get_or_init(|| {
+                Arc::new(MabScheduler::with_metrics(
+                    self.inner.mab_knobs.clone(),
+                    self.inner.prometheus_metrics.clone(),
+                ))
+            })
             .clone()
     }
 
@@ -1099,5 +1187,99 @@ mod tests {
         let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
         // Should have found CUDA-local CPUs
         assert!(!runtime.inner.tokio_cpus.is_empty());
+    }
+
+    // =============================================================================
+    // spawn_adaptive Tests
+    // =============================================================================
+
+    #[test]
+    fn test_spawn_adaptive_runs_work() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async { runtime.spawn_adaptive(|| 42).await });
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_spawn_adaptive_with_hint() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        let result = runtime.block_on(async {
+            runtime
+                .spawn_adaptive_with_hint(crate::ComputeHint::Low, || 100)
+                .await
+        });
+
+        assert_eq!(result, 100);
+    }
+
+    #[test]
+    fn test_spawn_adaptive_multiple_calls() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        runtime.block_on(async {
+            // Run many fast tasks to let MAB learn
+            for i in 0..50 {
+                let result = runtime.spawn_adaptive(move || i * 2).await;
+                assert_eq!(result, i * 2);
+            }
+        });
+    }
+
+    #[test]
+    fn test_spawn_adaptive_records_metrics() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        runtime.block_on(async {
+            // Run some adaptive tasks
+            for _ in 0..10 {
+                runtime.spawn_adaptive(|| std::hint::black_box(42)).await;
+            }
+        });
+
+        // Check that metrics were recorded
+        let metrics = runtime.prometheus_metrics();
+        let total_decisions = metrics.inline_decisions.get() + metrics.offload_decisions.get();
+        assert!(
+            total_decisions >= 10,
+            "Should have recorded at least 10 decisions, got {}",
+            total_decisions
+        );
+    }
+
+    #[test]
+    fn test_prometheus_metrics_use_prefix() {
+        let mut config = test_config();
+        config.prefix = "myapp".to_string();
+        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+
+        // The metrics should use the prefix from config
+        // We can verify by checking the registry if one was provided
+        let registry = prometheus::Registry::new();
+        runtime
+            .prometheus_metrics()
+            .register(&registry)
+            .expect("registration should succeed");
+
+        let families = registry.gather();
+        // Find a metric with our prefix
+        let myapp_metric = families.iter().find(|f| f.get_name().starts_with("myapp_"));
+        assert!(
+            myapp_metric.is_some(),
+            "Should find metrics with 'myapp_' prefix"
+        );
+
+        // Should not find metrics with default 'loom_' prefix
+        let loom_metric = families.iter().find(|f| f.get_name().starts_with("loom_"));
+        assert!(
+            loom_metric.is_none(),
+            "Should not find metrics with 'loom_' prefix"
+        );
     }
 }

@@ -9,6 +9,7 @@
 //! - **Always-on**: Counters are always incremented (zero overhead - just atomic ops)
 //! - **Registry optional**: Users can optionally provide a Registry for exposition
 //! - **Cached access**: Direct field access, no HashMap lookups in hot paths
+//! - **Configurable prefix**: Metric names use `{prefix}_` prefix (default: "loom")
 //!
 //! # Usage
 //!
@@ -89,75 +90,113 @@ impl Default for LoomMetrics {
 }
 
 impl LoomMetrics {
-    /// Create metrics without registering (standalone mode).
+    /// Create metrics with default prefix "loom".
     ///
     /// Counters work fine - just not exposed until registered.
     pub fn new() -> Self {
+        Self::with_prefix("loom")
+    }
+
+    /// Create metrics with a custom prefix.
+    ///
+    /// Metric names will be `{prefix}_inflight_tasks`, `{prefix}_total_spawns`, etc.
+    /// The prefix is sanitized to be a valid Prometheus metric name: hyphens and other
+    /// invalid characters are replaced with underscores.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let metrics = LoomMetrics::with_prefix("myapp");
+    /// // Creates metrics like: myapp_inflight_tasks, myapp_total_spawns, etc.
+    ///
+    /// let metrics = LoomMetrics::with_prefix("my-app");
+    /// // Creates metrics like: my_app_inflight_tasks, my_app_total_spawns, etc.
+    /// ```
+    pub fn with_prefix(prefix: &str) -> Self {
+        // Sanitize prefix for Prometheus: replace invalid chars with underscores
+        // Valid chars: [a-zA-Z_:] for first char, [a-zA-Z0-9_:] for rest
+        let prefix: String = prefix
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    if c.is_ascii_alphabetic() || c == '_' || c == ':' {
+                        c
+                    } else {
+                        '_'
+                    }
+                } else if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         Self {
             // Gauges
             inflight_tasks: IntGauge::with_opts(Opts::new(
-                "loom_inflight_tasks",
+                format!("{}_inflight_tasks", prefix),
                 "Tracked async tasks in flight",
             ))
             .expect("metric creation should not fail"),
 
             rayon_queue_depth: IntGauge::with_opts(Opts::new(
-                "loom_rayon_queue_depth",
+                format!("{}_rayon_queue_depth", prefix),
                 "Rayon task queue depth",
             ))
             .expect("metric creation should not fail"),
 
             spawn_rate: Gauge::with_opts(Opts::new(
-                "loom_spawn_rate",
+                format!("{}_spawn_rate", prefix),
                 "Task spawn rate per second",
             ))
             .expect("metric creation should not fail"),
 
             pressure_index: Gauge::with_opts(Opts::new(
-                "loom_pressure_index",
+                format!("{}_pressure_index", prefix),
                 "MAB pressure index (0-10)",
             ))
             .expect("metric creation should not fail"),
 
             // Counters
             total_spawns: IntCounter::with_opts(Opts::new(
-                "loom_total_spawns",
+                format!("{}_total_spawns", prefix),
                 "Total tasks spawned",
             ))
             .expect("metric creation should not fail"),
 
             starvation_events: IntCounter::with_opts(Opts::new(
-                "loom_starvation_events",
+                format!("{}_starvation_events", prefix),
                 "Starvation events detected",
             ))
             .expect("metric creation should not fail"),
 
             gr1_activations: IntCounter::with_opts(Opts::new(
-                "loom_gr1_activations",
+                format!("{}_gr1_activations", prefix),
                 "GR1 hard threshold activations",
             ))
             .expect("metric creation should not fail"),
 
             gr2_activations: IntCounter::with_opts(Opts::new(
-                "loom_gr2_activations",
+                format!("{}_gr2_activations", prefix),
                 "GR2 pressure threshold activations",
             ))
             .expect("metric creation should not fail"),
 
             gr3_activations: IntCounter::with_opts(Opts::new(
-                "loom_gr3_activations",
+                format!("{}_gr3_activations", prefix),
                 "GR3 strike suppression activations",
             ))
             .expect("metric creation should not fail"),
 
             inline_decisions: IntCounter::with_opts(Opts::new(
-                "loom_inline_decisions",
+                format!("{}_inline_decisions", prefix),
                 "MAB inline decisions",
             ))
             .expect("metric creation should not fail"),
 
             offload_decisions: IntCounter::with_opts(Opts::new(
-                "loom_offload_decisions",
+                format!("{}_offload_decisions", prefix),
                 "MAB offload decisions",
             ))
             .expect("metric creation should not fail"),
@@ -329,6 +368,31 @@ mod tests {
             .iter()
             .find(|f| f.get_name() == "loom_total_spawns");
         assert!(total_spawns.is_some());
+    }
+
+    #[test]
+    fn test_custom_prefix() {
+        let metrics = LoomMetrics::with_prefix("myapp");
+        let registry = Registry::new();
+
+        metrics
+            .register(&registry)
+            .expect("registration should succeed");
+
+        metrics.inc_total_spawns();
+
+        let families = registry.gather();
+        // Find metric with custom prefix
+        let total_spawns = families
+            .iter()
+            .find(|f| f.get_name() == "myapp_total_spawns");
+        assert!(total_spawns.is_some());
+
+        // Should not find metric with default prefix
+        let loom_total_spawns = families
+            .iter()
+            .find(|f| f.get_name() == "loom_total_spawns");
+        assert!(loom_total_spawns.is_none());
     }
 
     #[test]

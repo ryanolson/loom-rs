@@ -430,8 +430,11 @@ where
             let pool = runtime.inner.pools.get_or_create::<U>();
             let task_state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
-            // Create a per-stream scheduler with runtime's configured knobs
-            let scheduler = MabScheduler::new(runtime.inner.mab_knobs.clone());
+            // Create a per-stream scheduler with runtime's configured knobs and metrics
+            let scheduler = MabScheduler::with_metrics(
+                runtime.inner.mab_knobs.clone(),
+                runtime.inner.prometheus_metrics.clone(),
+            );
 
             AdaptiveMapState {
                 runtime: runtime.inner,
@@ -447,7 +450,7 @@ where
             // Poll the offload task
             match Pin::new(&mut pending.task).poll(cx) {
                 Poll::Ready(result) => {
-                    let elapsed_us = pending.start_time.elapsed().as_nanos() as f64 / 1000.0;
+                    let elapsed_us = pending.start_time.elapsed().as_secs_f64() * 1_000_000.0;
                     state
                         .scheduler
                         .finish(pending.decision_id, elapsed_us, None);
@@ -487,7 +490,7 @@ where
                         // Execute inline
                         let start = Instant::now();
                         let result = f(item);
-                        let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
+                        let elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0;
 
                         // Record immediately and return
                         state
@@ -523,7 +526,7 @@ where
                         match Pin::new(&mut pending.task).poll(cx) {
                             Poll::Ready(result) => {
                                 let elapsed_us =
-                                    pending.start_time.elapsed().as_nanos() as f64 / 1000.0;
+                                    pending.start_time.elapsed().as_secs_f64() * 1_000_000.0;
                                 state
                                     .scheduler
                                     .finish(pending.decision_id, elapsed_us, None);

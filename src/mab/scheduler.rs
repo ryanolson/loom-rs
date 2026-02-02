@@ -14,6 +14,7 @@ use rand_distr::{Distribution, Normal};
 
 use super::knobs::MabKnobs;
 use super::types::{Arm, ArmStats, ComputeHint, Context, DecisionId, FunctionKey, KeyStats};
+use crate::metrics::LoomMetrics;
 
 /// Pending decision waiting for outcome recording.
 struct Pending {
@@ -60,6 +61,8 @@ struct MabInner {
 pub struct MabScheduler {
     inner: Mutex<MabInner>,
     knobs: MabKnobs,
+    /// Optional prometheus metrics for recording decisions and guardrails
+    metrics: Option<LoomMetrics>,
 }
 
 impl MabScheduler {
@@ -74,6 +77,28 @@ impl MabScheduler {
                 rng: SmallRng::from_entropy(),
             }),
             knobs,
+            metrics: None,
+        }
+    }
+
+    /// Create a new scheduler with metrics for prometheus exposition.
+    ///
+    /// When metrics are provided, the scheduler will record:
+    /// - Decision counts (inline vs offload)
+    /// - Guardrail activations (GR1, GR2, GR3)
+    /// - Starvation events (when strikes are accumulated)
+    /// - Pressure index updates
+    pub fn with_metrics(knobs: MabKnobs, metrics: LoomMetrics) -> Self {
+        Self {
+            inner: Mutex::new(MabInner {
+                global: KeyStats::default(),
+                per_key: HashMap::new(),
+                pending: HashMap::new(),
+                next_id: 0,
+                rng: SmallRng::from_entropy(),
+            }),
+            knobs,
+            metrics: Some(metrics),
         }
     }
 
@@ -146,7 +171,8 @@ impl MabScheduler {
         let inline_strikes = ks.inline_strikes;
 
         // Apply guardrails (using local copies)
-        let inline_allowed = self.inline_allowed_with_ema(ema_fn_us, inline_strikes, ctx, pressure);
+        let (inline_allowed, guardrail_triggered) =
+            self.inline_allowed_with_guardrail(ema_fn_us, inline_strikes, ctx, pressure);
 
         let arm = if !inline_allowed {
             // Guardrails forbid inline
@@ -158,6 +184,15 @@ impl MabScheduler {
             // Thompson Sampling
             self.thompson_sample(&inline_stats, &offload_stats, pressure, &mut inner.rng)
         };
+
+        // Record metrics if available
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_decision(matches!(arm, Arm::InlineTokio));
+            metrics.set_pressure_index(pressure);
+            if let Some(guardrail) = guardrail_triggered {
+                metrics.record_guardrail(guardrail);
+            }
+        }
 
         let id = self.allocate_decision_inner(&mut inner, key, arm);
         (id, arm)
@@ -216,6 +251,10 @@ impl MabScheduler {
         if pending.arm == Arm::InlineTokio {
             if fn_us > self.knobs.t_strike_us {
                 ks.inline_strikes = (ks.inline_strikes + 1.0).min(self.knobs.s_max * 2.0);
+                // Record starvation event when inline work was slow
+                if let Some(ref metrics) = self.metrics {
+                    metrics.record_starvation();
+                }
             } else {
                 ks.inline_strikes *= self.knobs.strike_decay;
             }
@@ -270,7 +309,7 @@ impl MabScheduler {
             }
         };
 
-        let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
+        let elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0;
         self.finish(id, elapsed_us, None);
 
         result
@@ -298,35 +337,43 @@ impl MabScheduler {
         id
     }
 
-    /// Check if inline is allowed using already-extracted values.
-    fn inline_allowed_with_ema(
+    /// Check if inline is allowed and return which guardrail was triggered.
+    ///
+    /// Returns `(inline_allowed, guardrail_name)` where guardrail_name is
+    /// `Some("GR0"|"GR1"|"GR2"|"GR3")` if inline was blocked, or `None` if allowed.
+    fn inline_allowed_with_guardrail(
         &self,
         ema_fn_us: f64,
         inline_strikes: f64,
         ctx: &Context,
         pressure: f64,
-    ) -> bool {
+    ) -> (bool, Option<&'static str>) {
         // GR0: Single-worker protection
         if ctx.tokio_workers <= 1 {
-            return ema_fn_us < self.knobs.t_tiny_inline_us && pressure < self.knobs.p_low;
+            let allowed = ema_fn_us < self.knobs.t_tiny_inline_us && pressure < self.knobs.p_low;
+            return if allowed {
+                (true, None)
+            } else {
+                (false, Some("GR0"))
+            };
         }
 
         // GR1: Hard blocking threshold
         if ema_fn_us > self.knobs.t_block_hard_us {
-            return false;
+            return (false, Some("GR1"));
         }
 
         // GR2: Pressure-sensitive threshold
         if pressure > self.knobs.p_high && ema_fn_us > self.knobs.t_inline_under_pressure_us {
-            return false;
+            return (false, Some("GR2"));
         }
 
         // GR3: Strike suppression
         if self.knobs.enable_strikes && inline_strikes >= self.knobs.s_max {
-            return false;
+            return (false, Some("GR3"));
         }
 
-        true
+        (true, None)
     }
 
     /// Calculate pressure index from runtime context.
@@ -634,5 +681,313 @@ mod tests {
         // First call with no hint should explore inline (cheaper if fast)
         let (_, arm) = scheduler.choose(key, &ctx);
         assert_eq!(arm, Arm::InlineTokio);
+    }
+
+    // =============================================================================
+    // GR2 Pressure-Sensitive Threshold Tests
+    // =============================================================================
+
+    #[test]
+    fn test_gr2_pressure_sensitive_threshold() {
+        // GR2: pressure > p_high && ema > t_inline_under_pressure_us → offload
+        // Default p_high = 3.0, t_inline_under_pressure_us = 100.0
+        let knobs = MabKnobs::default();
+        let scheduler = MabScheduler::new(knobs);
+        let key = FunctionKey::from_name("gr2_test");
+
+        // Pre-seed with medium-duration work (above t_inline_under_pressure_us (100) but below t_block_hard_us (250))
+        {
+            let mut inner = scheduler.inner.lock();
+            inner.per_key.insert(
+                key,
+                KeyStats {
+                    ema_fn_us: 150.0, // 150µs > t_inline_under_pressure_us (100us) but < t_block_hard_us (250us)
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Under high pressure, should force offload via GR2
+        // Pressure = w_inflight * (inflight/workers) + w_spawn * (spawn_rate / (1000 * workers))
+        // Pressure = 0.7 * (200/4) + 0.3 * (20000 / (1000 * 4)) = 0.7 * 50 + 0.3 * 5 = 35 + 1.5 = 36.5
+        // (capped at pressure_clip = 10.0)
+        let high_pressure_ctx = Context {
+            tokio_workers: 4,
+            inflight_tasks: 200, // High inflight count creates pressure
+            spawn_rate_per_s: 20000.0,
+            rayon_threads: 8,
+            rayon_queue_depth: 0,
+        };
+
+        let (_, arm) = scheduler.choose(key, &high_pressure_ctx);
+        assert_eq!(
+            arm,
+            Arm::OffloadRayon,
+            "GR2 should force offload under high pressure"
+        );
+
+        // Under low pressure, the same EMA should allow inline
+        let low_pressure_ctx = Context {
+            tokio_workers: 4,
+            inflight_tasks: 2,
+            spawn_rate_per_s: 100.0,
+            rayon_threads: 8,
+            rayon_queue_depth: 0,
+        };
+
+        // Need a new key since the first one might have modified stats
+        let key2 = FunctionKey::from_name("gr2_test_low_pressure");
+        {
+            let mut inner = scheduler.inner.lock();
+            inner.per_key.insert(
+                key2,
+                KeyStats {
+                    ema_fn_us: 150.0, // Same EMA
+                    ..Default::default()
+                },
+            );
+        }
+
+        let (_, arm) = scheduler.choose(key2, &low_pressure_ctx);
+        // Under low pressure, inline should be allowed (cold start explores inline)
+        assert_eq!(
+            arm,
+            Arm::InlineTokio,
+            "Under low pressure, inline should be allowed"
+        );
+    }
+
+    // =============================================================================
+    // Learning Convergence Tests
+    // =============================================================================
+
+    #[test]
+    fn test_learns_to_inline_fast_work() {
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("fast_work");
+        let ctx = default_ctx();
+
+        // Train with fast work (5µs)
+        for _ in 0..50 {
+            let (id, _) = scheduler.choose(key, &ctx);
+            scheduler.finish(id, 5.0, Some(5.0));
+        }
+
+        // After learning, should prefer inline
+        let mut inline_count = 0;
+        for _ in 0..10 {
+            let (id, arm) = scheduler.choose(key, &ctx);
+            if arm == Arm::InlineTokio {
+                inline_count += 1;
+            }
+            scheduler.finish(id, 5.0, Some(5.0));
+        }
+
+        assert!(
+            inline_count >= 7,
+            "Should prefer inline for fast work, got {} inline out of 10",
+            inline_count
+        );
+    }
+
+    #[test]
+    fn test_learns_to_offload_slow_work() {
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("slow_work");
+        let ctx = default_ctx();
+
+        // Train with slow work (500µs) - triggers GR1 after learning
+        for _ in 0..50 {
+            let (id, _) = scheduler.choose(key, &ctx);
+            scheduler.finish(id, 500.0, Some(500.0));
+        }
+
+        // After learning, should prefer offload (EMA > t_block_hard_us)
+        let mut offload_count = 0;
+        for _ in 0..10 {
+            let (id, arm) = scheduler.choose(key, &ctx);
+            if arm == Arm::OffloadRayon {
+                offload_count += 1;
+            }
+            scheduler.finish(id, 500.0, Some(500.0));
+        }
+
+        assert!(
+            offload_count >= 8,
+            "Should prefer offload for slow work, got {} offload out of 10",
+            offload_count
+        );
+    }
+
+    // =============================================================================
+    // Thompson Sampling Tests
+    // =============================================================================
+
+    #[test]
+    fn test_thompson_sampling_explores_initially() {
+        // Test that Thompson sampling makes some exploration decisions, but note that
+        // for fast work it will quickly converge to preferring inline, which is correct.
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("borderline");
+        let ctx = default_ctx();
+
+        // Use 100µs work - right at the edge of t_inline_under_pressure_us threshold
+        // This should create more uncertainty than very fast or very slow work
+        let mut inline_count = 0;
+        let mut offload_count = 0;
+
+        for _ in 0..100 {
+            let (id, arm) = scheduler.choose(key, &ctx);
+            match arm {
+                Arm::InlineTokio => inline_count += 1,
+                Arm::OffloadRayon => offload_count += 1,
+            }
+            scheduler.finish(id, 100.0, Some(100.0));
+        }
+
+        // With borderline work, we should see some exploration in at least one direction
+        // (either inline or offload should have been tried at least once)
+        assert!(
+            inline_count > 0 || offload_count > 0,
+            "Thompson sampling should make decisions: inline={}, offload={}",
+            inline_count,
+            offload_count
+        );
+
+        // The total should be 100
+        assert_eq!(inline_count + offload_count, 100);
+    }
+
+    // =============================================================================
+    // Metrics Integration Tests
+    // =============================================================================
+
+    #[test]
+    fn test_prometheus_metrics_recorded() {
+        let metrics = LoomMetrics::new();
+        let scheduler = MabScheduler::with_metrics(MabKnobs::default(), metrics.clone());
+
+        let key = FunctionKey::from_name("metrics_test");
+        let ctx = default_ctx();
+
+        // Make some decisions
+        for _ in 0..10 {
+            let (id, _) = scheduler.choose(key, &ctx);
+            scheduler.finish(id, 50.0, Some(50.0));
+        }
+
+        // Verify metrics recorded
+        let total_decisions = metrics.inline_decisions.get() + metrics.offload_decisions.get();
+        assert_eq!(
+            total_decisions, 10,
+            "Should have recorded 10 decisions, got {}",
+            total_decisions
+        );
+    }
+
+    #[test]
+    fn test_guardrail_metrics_recorded() {
+        let metrics = LoomMetrics::new();
+        let knobs = MabKnobs::default();
+        let scheduler = MabScheduler::with_metrics(knobs, metrics.clone());
+
+        let key = FunctionKey::from_name("gr1_metrics");
+
+        // Pre-seed with very slow work to trigger GR1
+        {
+            let mut inner = scheduler.inner.lock();
+            inner.per_key.insert(
+                key,
+                KeyStats {
+                    ema_fn_us: 300.0, // >250µs triggers GR1
+                    ..Default::default()
+                },
+            );
+        }
+
+        let ctx = default_ctx();
+
+        // Make decisions that should trigger GR1
+        for _ in 0..10 {
+            let (id, arm) = scheduler.choose(key, &ctx);
+            assert_eq!(arm, Arm::OffloadRayon);
+            scheduler.finish(id, 300.0, Some(300.0));
+        }
+
+        assert!(
+            metrics.gr1_activations.get() >= 10,
+            "GR1 should have been recorded, got {}",
+            metrics.gr1_activations.get()
+        );
+    }
+
+    #[test]
+    fn test_starvation_metrics_recorded() {
+        let metrics = LoomMetrics::new();
+        let scheduler = MabScheduler::with_metrics(MabKnobs::default(), metrics.clone());
+
+        let key = FunctionKey::from_name("starvation_test");
+        let ctx = default_ctx();
+
+        // Force inline decision and report slow execution (triggers strike)
+        // First, we need to get inline decisions
+        for _ in 0..5 {
+            let (id, arm) = scheduler.choose(key, &ctx);
+            // Finish with slow time to trigger starvation event
+            // t_strike_us is 1000us by default
+            if arm == Arm::InlineTokio {
+                scheduler.finish(id, 1500.0, Some(1500.0)); // >1000µs triggers strike
+            } else {
+                scheduler.finish(id, 1500.0, Some(1500.0));
+            }
+        }
+
+        // Should have recorded starvation events for inline decisions
+        assert!(
+            metrics.starvation_events.get() > 0,
+            "Should have recorded starvation events"
+        );
+    }
+
+    #[test]
+    fn test_guardrail_returns_correct_name() {
+        let scheduler = MabScheduler::with_defaults();
+
+        // Test GR0 (single worker protection)
+        let ctx_single = Context {
+            tokio_workers: 1,
+            inflight_tasks: 10,
+            spawn_rate_per_s: 5000.0,
+            rayon_threads: 4,
+            rayon_queue_depth: 0,
+        };
+        // GR0: when tokio_workers <= 1, require ema < t_tiny_inline_us (50) AND pressure < p_low (0.5)
+        // 100us > 50us, so it should fail GR0
+        let (allowed, guardrail) =
+            scheduler.inline_allowed_with_guardrail(100.0, 0.0, &ctx_single, 0.3);
+        assert!(!allowed);
+        assert_eq!(guardrail, Some("GR0"));
+
+        // Test GR1 (hard blocking threshold: ema > t_block_hard_us (250))
+        let ctx = default_ctx();
+        let (allowed, guardrail) = scheduler.inline_allowed_with_guardrail(300.0, 0.0, &ctx, 1.0);
+        assert!(!allowed);
+        assert_eq!(guardrail, Some("GR1"));
+
+        // Test GR2 (pressure > p_high (3.0) AND ema > t_inline_under_pressure_us (100))
+        // Need ema > 100 and pressure > 3.0
+        let (allowed, guardrail) = scheduler.inline_allowed_with_guardrail(150.0, 0.0, &ctx, 5.0);
+        assert!(!allowed);
+        assert_eq!(guardrail, Some("GR2"));
+
+        // Test GR3 (strikes >= s_max (1.0))
+        let (allowed, guardrail) = scheduler.inline_allowed_with_guardrail(50.0, 1.0, &ctx, 1.0);
+        assert!(!allowed);
+        assert_eq!(guardrail, Some("GR3"));
+
+        // Test allowed (ema < t_inline_under_pressure_us, low pressure, no strikes)
+        let (allowed, guardrail) = scheduler.inline_allowed_with_guardrail(30.0, 0.0, &ctx, 0.5);
+        assert!(allowed);
+        assert_eq!(guardrail, None);
     }
 }

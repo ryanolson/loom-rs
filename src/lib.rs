@@ -168,7 +168,7 @@ pub use builder::{LoomArgs, LoomBuilder};
 pub use config::LoomConfig;
 pub use context::current_runtime;
 pub use error::{LoomError, Result};
-pub use mab::{ComputeHint, ComputeHintProvider, MabKnobs, MabScheduler};
+pub use mab::{Arm, ComputeHint, ComputeHintProvider, MabKnobs, MabScheduler};
 pub use metrics::LoomMetrics;
 pub use runtime::LoomRuntime;
 pub use stream::ComputeStreamExt;
@@ -236,4 +236,72 @@ where
         let rt = rt;
         async move { rt.spawn_compute(f).await }
     })
+}
+
+/// Spawn adaptive work using the current runtime.
+///
+/// This is a convenience function for `loom_rs::current_runtime().unwrap().spawn_adaptive(f)`.
+/// Uses MAB (Multi-Armed Bandit) to learn whether to inline or offload work.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context.
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::LoomBuilder;
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     // MAB adaptively decides inline vs offload
+///     let result = loom_rs::spawn_adaptive(|| {
+///         process_work()
+///     }).await;
+/// });
+/// ```
+pub async fn spawn_adaptive<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    current_runtime()
+        .expect("spawn_adaptive called outside loom runtime")
+        .spawn_adaptive(f)
+        .await
+}
+
+/// Spawn adaptive work with hint using the current runtime.
+///
+/// Like `spawn_adaptive()`, but provides a hint to guide cold-start behavior.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context.
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::{LoomBuilder, ComputeHint};
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     // Hint that this is likely expensive work
+///     let result = loom_rs::spawn_adaptive_with_hint(
+///         ComputeHint::High,
+///         || expensive_work()
+///     ).await;
+/// });
+/// ```
+pub async fn spawn_adaptive_with_hint<F, R>(hint: ComputeHint, f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    current_runtime()
+        .expect("spawn_adaptive_with_hint called outside loom runtime")
+        .spawn_adaptive_with_hint(hint, f)
+        .await
 }

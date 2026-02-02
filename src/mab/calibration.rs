@@ -118,7 +118,7 @@ pub async fn calibrate(
             completion.complete(());
         });
         task.await;
-        samples.push(start.elapsed().as_nanos() as f64 / 1000.0);
+        samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
     }
 
     // Compute statistics
