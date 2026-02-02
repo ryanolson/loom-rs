@@ -135,8 +135,9 @@ impl LoomMetrics {
     /// The prefix is sanitized to be a valid Prometheus metric name: hyphens and other
     /// invalid characters are replaced with underscores.
     ///
-    /// If the prefix is empty or consists entirely of invalid characters that would
-    /// result in an empty string after sanitization, the default prefix "loom" is used.
+    /// If the prefix is empty after sanitization, the default prefix "loom" is used.
+    /// Note: A prefix consisting entirely of invalid characters (like "---") will be
+    /// sanitized to underscores (e.g., "___"), not empty, so it will be used as-is.
     ///
     /// # Example
     ///
@@ -631,8 +632,8 @@ mod tests {
 
     #[test]
     fn test_all_invalid_chars_prefix() {
-        // Prefix with only invalid characters (after first char sanitization)
-        // Since first char becomes '_' and rest are invalid, we get a prefix
+        // Prefix with only invalid characters becomes all underscores after sanitization
+        // "---" becomes "___" (three underscores), which is valid but not ideal
         let metrics = LoomMetrics::with_prefix("---");
         let registry = Registry::new();
 
@@ -643,7 +644,7 @@ mod tests {
         metrics.inc_total_spawns();
 
         let families = registry.gather();
-        // "---" becomes "___"
+        // "---" becomes "___", then metric becomes "____total_spawns" (prefix + "_" separator)
         let total_spawns = families
             .iter()
             .find(|f| f.get_name() == "____total_spawns");
