@@ -25,18 +25,14 @@ A Rust crate providing a bespoke thread pool runtime combining tokio and rayon w
 
 ## Installation
 
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-loom-rs = "0.3"
+```bash
+cargo add loom-rs
 ```
 
 For CUDA support (Linux only):
 
-```toml
-[dependencies]
-loom-rs = { version = "0.3", features = ["cuda"] }
+```bash
+cargo add loom-rs --features cuda
 ```
 
 ## Quick Start
