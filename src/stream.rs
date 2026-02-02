@@ -216,15 +216,18 @@ struct ComputeMapState<U: Send + 'static> {
 impl<U: Send + 'static> Drop for ComputeMapState<U> {
     fn drop(&mut self) {
         // Return TaskState to pool if there's no pending task
-        // (which would still be using it)
-        if self.pending.is_none() {
+        // (which would still be using it on the rayon thread).
+        // Skip cleanup during panic to avoid potential double-panic.
+        if self.pending.is_none() && !std::thread::panicking() {
             self.task_state.reset();
             // Clone the Arc before pushing - we need ownership
             let task_state = Arc::clone(&self.task_state);
             self.pool.push(task_state);
         }
-        // If there's a pending task, the TaskState will be dropped with it
-        // This is a rare edge case (stream dropped while compute in flight)
+        // If there's a pending task, the TaskState is still in use by rayon.
+        // It will be freed (not leaked) when rayon completes, but won't be
+        // returned to the pool. This is acceptable - the pool will allocate
+        // a new one if needed.
     }
 }
 
@@ -384,13 +387,18 @@ struct AdaptiveMapState<U: Send + 'static> {
 
 impl<U: Send + 'static> Drop for AdaptiveMapState<U> {
     fn drop(&mut self) {
-        // Return TaskState to pool if there's no pending offload task
-        // Skip cleanup during panic to avoid potential double-panic
+        // Return TaskState to pool if there's no pending task
+        // (which would still be using it on the rayon thread).
+        // Skip cleanup during panic to avoid potential double-panic.
         if self.pending.is_none() && !std::thread::panicking() {
             self.task_state.reset();
             let task_state = Arc::clone(&self.task_state);
             self.pool.push(task_state);
         }
+        // If there's a pending task, the TaskState is still in use by rayon.
+        // It will be freed (not leaked) when rayon completes, but won't be
+        // returned to the pool. This is acceptable - the pool will allocate
+        // a new one if needed.
     }
 }
 

@@ -139,12 +139,22 @@ fn generate_mixed_workload(count: usize) -> Vec<WorkItem> {
 }
 
 /// Statistics per complexity level
-#[derive(Default)]
 struct ComplexityStats {
     count: usize,
     total_time_us: f64,
     min_time_us: f64,
     max_time_us: f64,
+}
+
+impl Default for ComplexityStats {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            total_time_us: 0.0,
+            min_time_us: f64::MAX, // Start high so first value becomes minimum
+            max_time_us: 0.0,
+        }
+    }
 }
 
 impl ComplexityStats {

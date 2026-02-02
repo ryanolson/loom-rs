@@ -237,26 +237,21 @@ impl LoomRuntime {
     pub(crate) fn from_config(config: LoomConfig, pool_size: usize) -> Result<Self> {
         // Determine available CPUs
         // Priority: CUDA device cpuset > user cpuset > all available CPUs
-        // Error if both cuda_device and cpuset are specified and CUDA cpuset is accurate
+        // Error if both cuda_device and cpuset are specified (mutually exclusive)
         let cpus = {
             #[cfg(feature = "cuda")]
             {
+                // Check for conflicting configuration first
+                if config.cuda_device.is_some() && config.cpuset.is_some() {
+                    return Err(LoomError::CudaCpusetConflict);
+                }
+
                 if let Some(ref selector) = config.cuda_device {
                     match crate::cuda::cpuset_for_cuda_device(selector)? {
-                        Some(cuda_cpus) => {
-                            // CUDA cpuset was successfully determined
-                            if config.cpuset.is_some() {
-                                return Err(LoomError::CudaCpusetConflict);
-                            }
-                            cuda_cpus
-                        }
+                        Some(cuda_cpus) => cuda_cpus,
                         None => {
-                            // Could not determine CUDA locality, fall back
-                            if let Some(ref cpuset_str) = config.cpuset {
-                                parse_and_validate_cpuset(cpuset_str)?
-                            } else {
-                                available_cpus()
-                            }
+                            // Could not determine CUDA locality, fall back to all CPUs
+                            available_cpus()
                         }
                     }
                 } else if let Some(ref cpuset_str) = config.cpuset {
