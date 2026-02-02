@@ -106,6 +106,11 @@ pub struct MabKnobs {
     /// Default: 3
     pub hint_exploration_count: u32,
 
+    /// Minimum samples before trusting hint-specific EMA.
+    /// Below this threshold, falls back to global `ema_fn_us`.
+    /// Default: 3.0
+    pub hint_min_samples: f64,
+
     // === Initial EMA seeds for hints ===
     /// Initial EMA estimate for Low hint (microseconds).
     /// Default: 30.0
@@ -162,6 +167,7 @@ impl Default for MabKnobs {
             // Compute hints
             hint_trust_threshold: 5.0,
             hint_exploration_count: 3,
+            hint_min_samples: 3.0,
             hint_low_ema_us: 30.0,
             hint_medium_ema_us: 200.0,
             hint_high_ema_us: 1000.0,
