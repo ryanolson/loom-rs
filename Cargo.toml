@@ -1,6 +1,6 @@
 [package]
 name = "loom-rs"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Weaving threads together - A bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities"
 license = "MIT"
