@@ -1611,8 +1611,7 @@ mod tests {
     fn test_scope_compute_nested_spawns() {
         use std::sync::atomic::{AtomicI32, Ordering};
 
-        let mut config = test_config();
-        config.rayon_threads = Some(4);
+        let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
