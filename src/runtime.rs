@@ -2000,4 +2000,20 @@ mod tests {
             total_decisions
         );
     }
+
+    /// Test that panics inside scope_adaptive are properly propagated.
+    #[test]
+    #[should_panic(expected = "intentional panic in scope_adaptive")]
+    fn test_scope_adaptive_panic_propagation() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        runtime.block_on(async {
+            runtime
+                .scope_adaptive(|_s| {
+                    panic!("intentional panic in scope_adaptive");
+                })
+                .await
+        });
+    }
 }
