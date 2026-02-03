@@ -245,7 +245,8 @@ impl LoomRuntime {
     /// Create a runtime from a configuration.
     ///
     /// This is typically called via `LoomBuilder::build()`.
-    pub(crate) fn from_config(config: LoomConfig, pool_size: usize) -> Result<Self> {
+    pub(crate) fn from_config(config: LoomConfig) -> Result<Self> {
+        let pool_size = config.compute_pool_size;
         // Determine available CPUs
         // Priority: CUDA device cpuset > user cpuset > all available CPUs
         // Error if both cuda_device and cpuset are specified (mutually exclusive)
@@ -758,6 +759,130 @@ impl LoomRuntime {
         self.inner.scope_compute(f).await
     }
 
+    /// Execute scoped work with adaptive sync/async decision.
+    ///
+    /// Uses MAB (Multi-Armed Bandit) to learn whether this function type should:
+    /// - Run synchronously via `install()` (blocks tokio worker, lower overhead)
+    /// - Run asynchronously via `scope_compute()` (frees tokio worker, higher overhead)
+    ///
+    /// Unlike `spawn_adaptive()` which chooses between inline execution and rayon offload,
+    /// `scope_adaptive` always uses `rayon::scope` (needed for parallel spawning with
+    /// borrowed data), but chooses whether to block the tokio worker or use the async bridge.
+    ///
+    /// # Performance
+    ///
+    /// | Scenario | Behavior | Overhead |
+    /// |----------|----------|----------|
+    /// | Fast scoped work | Sync after learning | ~0ns (install overhead only) |
+    /// | Slow scoped work | Async after learning | ~100-500ns (+ bridge) |
+    /// | Cold start | Explores both arms | Variable |
+    ///
+    /// # When to Use
+    ///
+    /// Use `scope_adaptive` when:
+    /// - You need to borrow local data (`'env` lifetime)
+    /// - You want parallel spawning via `rayon::scope`
+    /// - Work duration varies and you want the runtime to learn the best strategy
+    ///
+    /// Use `scope_compute` directly when:
+    /// - Work is always slow (> 500µs)
+    /// - You want consistent async behavior
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::sync::atomic::{AtomicI32, Ordering};
+    ///
+    /// runtime.block_on(async {
+    ///     let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    ///     let sum = AtomicI32::new(0);
+    ///
+    ///     // MAB learns whether this is fast or slow scoped work
+    ///     runtime.scope_adaptive(|s| {
+    ///         let (left, right) = data.split_at(data.len() / 2);
+    ///         let sum_ref = &sum;
+    ///
+    ///         s.spawn(move |_| {
+    ///             sum_ref.fetch_add(left.iter().sum(), Ordering::Relaxed);
+    ///         });
+    ///         s.spawn(move |_| {
+    ///             sum_ref.fetch_add(right.iter().sum(), Ordering::Relaxed);
+    ///         });
+    ///     }).await;
+    ///
+    ///     println!("Sum: {}", sum.load(Ordering::Relaxed));
+    /// });
+    /// ```
+    pub async fn scope_adaptive<'env, F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
+        R: Send + 'env,
+    {
+        self.scope_adaptive_with_hint(ComputeHint::Unknown, f).await
+    }
+
+    /// Execute scoped work with hint for cold-start guidance.
+    ///
+    /// The hint helps the scheduler make better initial decisions before it has
+    /// learned the actual execution time of this function type.
+    ///
+    /// # Hints
+    ///
+    /// - `ComputeHint::Low` - Expected < 50µs (likely sync-safe)
+    /// - `ComputeHint::Medium` - Expected 50-500µs (borderline)
+    /// - `ComputeHint::High` - Expected > 500µs (should test async early)
+    /// - `ComputeHint::Unknown` - No hint (default exploration)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use loom_rs::ComputeHint;
+    /// use std::sync::atomic::{AtomicI32, Ordering};
+    ///
+    /// runtime.block_on(async {
+    ///     let data = vec![1, 2, 3, 4];
+    ///     let sum = AtomicI32::new(0);
+    ///
+    ///     // Hint that this is likely fast work
+    ///     runtime.scope_adaptive_with_hint(ComputeHint::Low, |s| {
+    ///         let sum_ref = &sum;
+    ///         for &val in &data {
+    ///             s.spawn(move |_| {
+    ///                 sum_ref.fetch_add(val, Ordering::Relaxed);
+    ///             });
+    ///         }
+    ///     }).await;
+    /// });
+    /// ```
+    pub async fn scope_adaptive_with_hint<'env, F, R>(&self, hint: ComputeHint, f: F) -> R
+    where
+        F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
+        R: Send + 'env,
+    {
+        let ctx = self.collect_context();
+        // Use from_type_name since F may capture non-'static references
+        let key = FunctionKey::from_type_name::<F>();
+        let scheduler = self.mab_scheduler();
+
+        let (id, arm) = scheduler.choose_with_hint(key, &ctx, hint);
+        let start = Instant::now();
+
+        let result = match arm {
+            Arm::InlineTokio => {
+                // Sync: blocks tokio but no async bridge overhead
+                self.install(|| rayon::scope(|s| f(s)))
+            }
+            Arm::OffloadRayon => {
+                // Async: frees tokio worker during execution
+                self.scope_compute(f).await
+            }
+        };
+
+        let elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+        scheduler.finish(id, elapsed_us, Some(elapsed_us));
+        result
+    }
+
     /// Stop accepting new tasks.
     ///
     /// After calling this, `spawn_async()` and `spawn_compute()` will still
@@ -1084,14 +1209,14 @@ mod tests {
     #[test]
     fn test_runtime_creation() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
         assert_eq!(runtime.config().prefix, "test");
     }
 
     #[test]
     fn test_block_on() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async { 42 });
         assert_eq!(result, 42);
@@ -1100,7 +1225,7 @@ mod tests {
     #[test]
     fn test_spawn_compute() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result =
             runtime.block_on(async { runtime.spawn_compute(|| (0..100).sum::<i32>()).await });
@@ -1110,7 +1235,7 @@ mod tests {
     #[test]
     fn test_spawn_async() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             let handle = runtime.spawn_async(async { 42 });
@@ -1122,7 +1247,7 @@ mod tests {
     #[test]
     fn test_install() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.install(|| {
             use rayon::prelude::*;
@@ -1134,7 +1259,7 @@ mod tests {
     #[test]
     fn test_shutdown_and_idle() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         // Initially not idle (tracker not closed)
         assert!(!runtime.is_idle());
@@ -1147,7 +1272,7 @@ mod tests {
     #[test]
     fn test_block_until_idle() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             runtime.spawn_async(async { 42 });
@@ -1165,14 +1290,14 @@ mod tests {
         config.tokio_threads = Some(2);
         config.rayon_threads = Some(2);
 
-        let result = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE);
+        let result = LoomRuntime::from_config(config);
         assert!(matches!(result, Err(LoomError::InsufficientCpus { .. })));
     }
 
     #[test]
     fn test_current_runtime_in_block_on() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             // current_runtime should work inside block_on
@@ -1187,7 +1312,7 @@ mod tests {
     #[test]
     fn test_spawn_compute_pooling() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         // Warmup - first call allocates
         runtime.block_on(async {
@@ -1245,7 +1370,7 @@ mod tests {
     #[test]
     fn test_compute_tasks_in_flight() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         // Initially no tasks
         assert_eq!(runtime.compute_tasks_in_flight(), 0);
@@ -1260,7 +1385,7 @@ mod tests {
     #[test]
     fn test_display() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let display = format!("{}", runtime);
         assert!(display.starts_with("LoomRuntime[test]:"));
@@ -1275,7 +1400,7 @@ mod tests {
         config.tokio_threads = Some(1);
         config.rayon_threads = Some(0);
 
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
         // Should use the user-provided cpuset
         assert_eq!(runtime.inner.tokio_cpus, vec![0]);
     }
@@ -1289,7 +1414,7 @@ mod tests {
         config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
         config.cpuset = Some("0".to_string()); // Conflict: both specified
 
-        let result = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE);
+        let result = LoomRuntime::from_config(config);
         assert!(
             matches!(result, Err(LoomError::CudaCpusetConflict)),
             "expected CudaCpusetConflict error, got {:?}",
@@ -1305,7 +1430,7 @@ mod tests {
         config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
         config.cpuset = None;
 
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
         // Should have found CUDA-local CPUs
         assert!(!runtime.inner.tokio_cpus.is_empty());
     }
@@ -1317,7 +1442,7 @@ mod tests {
     #[test]
     fn test_spawn_adaptive_runs_work() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async { runtime.spawn_adaptive(|| 42).await });
 
@@ -1327,7 +1452,7 @@ mod tests {
     #[test]
     fn test_spawn_adaptive_with_hint() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             runtime
@@ -1341,7 +1466,7 @@ mod tests {
     #[test]
     fn test_spawn_adaptive_multiple_calls() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             // Run many fast tasks to let MAB learn
@@ -1355,7 +1480,7 @@ mod tests {
     #[test]
     fn test_spawn_adaptive_records_metrics() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             // Run some adaptive tasks
@@ -1378,7 +1503,7 @@ mod tests {
     fn test_prometheus_metrics_use_prefix() {
         let mut config = test_config();
         config.prefix = "myapp".to_string();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         // The metrics should use the prefix from config
         // We can verify by checking the registry if one was provided
@@ -1411,7 +1536,7 @@ mod tests {
     #[test]
     fn test_scope_compute_basic() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             runtime
@@ -1428,7 +1553,7 @@ mod tests {
     #[test]
     fn test_scope_compute_borrow_local_data() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1454,7 +1579,7 @@ mod tests {
 
         let mut config = test_config();
         config.rayon_threads = Some(2);
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1488,7 +1613,7 @@ mod tests {
 
         let mut config = test_config();
         config.rayon_threads = Some(4);
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1526,7 +1651,7 @@ mod tests {
     #[test]
     fn test_scope_compute_with_rayon_par_iter() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
@@ -1546,7 +1671,7 @@ mod tests {
     #[test]
     fn test_scope_compute_tracks_compute_tasks() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         // Initially no tasks
         assert_eq!(runtime.compute_tasks_in_flight(), 0);
@@ -1562,7 +1687,7 @@ mod tests {
     #[test]
     fn test_scope_compute_data_still_valid_after() {
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             let mut data = vec![1, 2, 3, 4, 5];
@@ -1590,7 +1715,7 @@ mod tests {
         use std::time::Duration;
 
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             let concurrent_task_ran = Arc::new(AtomicBool::new(false));
@@ -1631,6 +1756,41 @@ mod tests {
         });
     }
 
+    /// Test that mirrors the documentation example for scope_compute.
+    /// This ensures the example code actually compiles and works.
+    #[test]
+    fn test_scope_compute_doc_example() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        let result = runtime.block_on(async {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let sum = AtomicI32::new(0);
+
+            runtime
+                .scope_compute(|s| {
+                    let (left, right) = data.split_at(data.len() / 2);
+                    let sum_ref = &sum;
+
+                    s.spawn(move |_| {
+                        sum_ref.fetch_add(left.iter().sum::<i32>(), Ordering::Relaxed);
+                    });
+                    s.spawn(move |_| {
+                        sum_ref.fetch_add(right.iter().sum::<i32>(), Ordering::Relaxed);
+                    });
+                })
+                .await;
+
+            // Verify data is still accessible after scope_compute
+            assert_eq!(data.len(), 8);
+            sum.load(Ordering::Relaxed)
+        });
+
+        assert_eq!(result, 36); // 1+2+3+4+5+6+7+8 = 36
+    }
+
     /// Test that scope_compute works correctly with tokio::select! (cancellation scenario).
     /// The future should block on drop until the scope completes.
     #[test]
@@ -1640,7 +1800,7 @@ mod tests {
         use std::time::Duration;
 
         let config = test_config();
-        let runtime = LoomRuntime::from_config(config, DEFAULT_POOL_SIZE).unwrap();
+        let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             let scope_completed = Arc::new(AtomicBool::new(false));
@@ -1675,5 +1835,119 @@ mod tests {
                 "Scope should have completed even though future was cancelled"
             );
         });
+    }
+
+    // =============================================================================
+    // scope_adaptive Tests
+    // =============================================================================
+
+    #[test]
+    fn test_scope_adaptive_basic() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        let result = runtime.block_on(async {
+            runtime
+                .scope_adaptive(|_s| {
+                    // Simple computation without spawning
+                    42
+                })
+                .await
+        });
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_scope_adaptive_with_hint() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        let result = runtime.block_on(async {
+            runtime
+                .scope_adaptive_with_hint(crate::ComputeHint::Low, |_s| 100)
+                .await
+        });
+
+        assert_eq!(result, 100);
+    }
+
+    #[test]
+    fn test_scope_adaptive_borrow_local_data() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        let result = runtime.block_on(async {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+            let sum = runtime
+                .scope_adaptive(|_s| {
+                    // Borrow data inside the scope
+                    data.iter().sum::<i32>()
+                })
+                .await;
+
+            // data is still valid after scope_adaptive
+            assert_eq!(data.len(), 8);
+            sum
+        });
+
+        assert_eq!(result, 36);
+    }
+
+    #[test]
+    fn test_scope_adaptive_parallel_with_atomic() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let mut config = test_config();
+        config.rayon_threads = Some(2);
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        let result = runtime.block_on(async {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let sum = AtomicI32::new(0);
+
+            runtime
+                .scope_adaptive(|s| {
+                    let (left, right) = data.split_at(data.len() / 2);
+                    let sum_ref = &sum;
+
+                    s.spawn(move |_| {
+                        let partial: i32 = left.iter().sum();
+                        sum_ref.fetch_add(partial, Ordering::Relaxed);
+                    });
+                    s.spawn(move |_| {
+                        let partial: i32 = right.iter().sum();
+                        sum_ref.fetch_add(partial, Ordering::Relaxed);
+                    });
+                })
+                .await;
+
+            sum.load(Ordering::Relaxed)
+        });
+
+        assert_eq!(result, 36);
+    }
+
+    #[test]
+    fn test_scope_adaptive_records_metrics() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        runtime.block_on(async {
+            // Run some adaptive tasks
+            for _ in 0..10 {
+                runtime.scope_adaptive(|_s| std::hint::black_box(42)).await;
+            }
+        });
+
+        // Check that metrics were recorded
+        let metrics = runtime.prometheus_metrics();
+        let total_decisions = metrics.inline_decisions.get() + metrics.offload_decisions.get();
+        assert!(
+            total_decisions >= 10,
+            "Should have recorded at least 10 decisions, got {}",
+            total_decisions
+        );
     }
 }

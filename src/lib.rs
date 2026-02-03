@@ -337,26 +337,29 @@ where
 ///
 /// ```ignore
 /// use loom_rs::LoomBuilder;
+/// use std::sync::atomic::{AtomicI32, Ordering};
 ///
 /// let runtime = LoomBuilder::new().build()?;
 ///
 /// runtime.block_on(async {
 ///     let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+///     let sum = AtomicI32::new(0);
 ///
-///     // Borrow `data` for parallel processing - no need to pass &runtime
-///     let sum: i32 = loom_rs::scope_compute(|s| {
+///     // Borrow `data` and `sum` for parallel processing - no need to pass &runtime
+///     loom_rs::scope_compute(|s| {
 ///         let (left, right) = data.split_at(data.len() / 2);
+///         let sum_ref = &sum;
 ///
-///         let mut left_sum = 0;
-///         let mut right_sum = 0;
-///
-///         s.spawn(|_| left_sum = left.iter().sum());
-///         s.spawn(|_| right_sum = right.iter().sum());
-///
-///         left_sum + right_sum
+///         s.spawn(move |_| {
+///             sum_ref.fetch_add(left.iter().sum::<i32>(), Ordering::Relaxed);
+///         });
+///         s.spawn(move |_| {
+///             sum_ref.fetch_add(right.iter().sum::<i32>(), Ordering::Relaxed);
+///         });
 ///     }).await;
 ///
-///     println!("Sum: {}", sum);
+///     // data and sum are still valid here
+///     println!("Sum of {:?} = {}", data, sum.load(Ordering::Relaxed));
 /// });
 /// ```
 pub async fn scope_compute<'env, F, R>(f: F) -> R
