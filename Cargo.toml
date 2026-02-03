@@ -8,6 +8,9 @@ repository = "https://github.com/ryanolson/loom-rs"
 keywords = ["async", "runtime", "threadpool", "cpu-affinity", "tokio"]
 categories = ["asynchronous", "concurrency"]
 
+[workspace]
+members = ["loom-macros"]
+
 [dependencies]
 loom-macros = { path = "loom-macros", version = "0.3.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

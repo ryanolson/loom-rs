@@ -50,99 +50,6 @@ use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
-/// State for tracking in-flight compute tasks.
-///
-/// Combines the task counter with a notification mechanism for efficient
-/// shutdown waiting (avoids spin loops).
-struct ComputeTaskState {
-    /// Number of tasks currently executing on rayon
-    count: AtomicUsize,
-    /// Notified when count reaches 0
-    notify: Notify,
-}
-
-impl ComputeTaskState {
-    fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            notify: Notify::new(),
-        }
-    }
-}
-
-/// Guard for tracking async task metrics.
-///
-/// Panic-safe: task_completed is called even if the future panics.
-struct AsyncMetricsGuard {
-    inner: Arc<LoomRuntimeInner>,
-}
-
-impl AsyncMetricsGuard {
-    fn new(inner: Arc<LoomRuntimeInner>) -> Self {
-        inner.prometheus_metrics.task_started();
-        Self { inner }
-    }
-}
-
-impl Drop for AsyncMetricsGuard {
-    fn drop(&mut self) {
-        self.inner.prometheus_metrics.task_completed();
-    }
-}
-
-/// Guard for tracking compute task state and metrics.
-///
-/// Panic-safe: executes even if the task closure panics.
-///
-/// SAFETY: The state lives in LoomRuntimeInner which outlives all rayon tasks
-/// because block_until_idle waits for compute_tasks to reach 0.
-struct ComputeTaskGuard {
-    state: *const ComputeTaskState,
-    metrics: *const LoomMetrics,
-}
-
-unsafe impl Send for ComputeTaskGuard {}
-
-impl ComputeTaskGuard {
-    /// Create a new guard, tracking submission in MAB metrics.
-    ///
-    /// This should be called BEFORE spawning on rayon.
-    fn new(state: &ComputeTaskState, metrics: &LoomMetrics) -> Self {
-        state.count.fetch_add(1, Ordering::Relaxed);
-        metrics.rayon_submitted();
-        Self {
-            state: state as *const ComputeTaskState,
-            metrics: metrics as *const LoomMetrics,
-        }
-    }
-
-    /// Mark that the rayon task has started executing.
-    ///
-    /// This should be called at the START of the rayon closure.
-    fn started(&self) {
-        // SAFETY: metrics outlives rayon tasks
-        unsafe {
-            (*self.metrics).rayon_started();
-        }
-    }
-}
-
-impl Drop for ComputeTaskGuard {
-    fn drop(&mut self) {
-        // SAFETY: state and metrics outlive rayon tasks due to shutdown waiting
-        unsafe {
-            // Track MAB metrics completion (panic-safe)
-            (*self.metrics).rayon_completed();
-
-            let prev = (*self.state).count.fetch_sub(1, Ordering::Release);
-            if prev == 1 {
-                // Count just went from 1 to 0, notify waiters
-                (*self.state).notify.notify_waiters();
-            }
-        }
-    }
-}
-
 /// A bespoke thread pool runtime combining tokio and rayon with CPU pinning.
 ///
 /// The runtime provides:
@@ -1277,6 +1184,99 @@ impl std::fmt::Display for LoomRuntime {
             self.inner.rayon_threads,
             format_cpuset(&self.inner.rayon_cpus),
         )
+    }
+}
+
+/// State for tracking in-flight compute tasks.
+///
+/// Combines the task counter with a notification mechanism for efficient
+/// shutdown waiting (avoids spin loops).
+struct ComputeTaskState {
+    /// Number of tasks currently executing on rayon
+    count: AtomicUsize,
+    /// Notified when count reaches 0
+    notify: Notify,
+}
+
+impl ComputeTaskState {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+}
+
+/// Guard for tracking async task metrics.
+///
+/// Panic-safe: task_completed is called even if the future panics.
+struct AsyncMetricsGuard {
+    inner: Arc<LoomRuntimeInner>,
+}
+
+impl AsyncMetricsGuard {
+    fn new(inner: Arc<LoomRuntimeInner>) -> Self {
+        inner.prometheus_metrics.task_started();
+        Self { inner }
+    }
+}
+
+impl Drop for AsyncMetricsGuard {
+    fn drop(&mut self) {
+        self.inner.prometheus_metrics.task_completed();
+    }
+}
+
+/// Guard for tracking compute task state and metrics.
+///
+/// Panic-safe: executes even if the task closure panics.
+///
+/// SAFETY: The state lives in LoomRuntimeInner which outlives all rayon tasks
+/// because block_until_idle waits for compute_tasks to reach 0.
+struct ComputeTaskGuard {
+    state: *const ComputeTaskState,
+    metrics: *const LoomMetrics,
+}
+
+unsafe impl Send for ComputeTaskGuard {}
+
+impl ComputeTaskGuard {
+    /// Create a new guard, tracking submission in MAB metrics.
+    ///
+    /// This should be called BEFORE spawning on rayon.
+    fn new(state: &ComputeTaskState, metrics: &LoomMetrics) -> Self {
+        state.count.fetch_add(1, Ordering::Relaxed);
+        metrics.rayon_submitted();
+        Self {
+            state: state as *const ComputeTaskState,
+            metrics: metrics as *const LoomMetrics,
+        }
+    }
+
+    /// Mark that the rayon task has started executing.
+    ///
+    /// This should be called at the START of the rayon closure.
+    fn started(&self) {
+        // SAFETY: metrics outlives rayon tasks
+        unsafe {
+            (*self.metrics).rayon_started();
+        }
+    }
+}
+
+impl Drop for ComputeTaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: state and metrics outlive rayon tasks due to shutdown waiting
+        unsafe {
+            // Track MAB metrics completion (panic-safe)
+            (*self.metrics).rayon_completed();
+
+            let prev = (*self.state).count.fetch_sub(1, Ordering::Release);
+            if prev == 1 {
+                // Count just went from 1 to 0, notify waiters
+                (*self.state).notify.notify_waiters();
+            }
+        }
     }
 }
 
