@@ -89,6 +89,17 @@ impl TestConfig {
 /// }
 /// ```
 ///
+/// With Result return type (supports anyhow::Result, etc.):
+///
+/// ```ignore
+/// #[loom_rs::test]
+/// async fn test_with_result() -> anyhow::Result<()> {
+///     let result = loom_rs::spawn_compute(|| 42).await;
+///     assert_eq!(result, 42);
+///     Ok(())
+/// }
+/// ```
+///
 /// Custom thread counts:
 ///
 /// ```ignore
@@ -145,21 +156,46 @@ fn generate_test(input: ItemFn, config: TestConfig) -> syn::Result<TokenStream2>
     let mut new_sig = sig.clone();
     new_sig.asyncness = None;
 
-    // Generate the test function
-    let output = quote! {
-        #[::core::prelude::v1::test]
-        #(#attrs)*
-        #vis #new_sig {
-            let __loom_runtime = ::loom_rs::LoomBuilder::new()
-                .prefix(concat!("test-", stringify!(#fn_name)))
-                .tokio_threads(#tokio_threads)
-                .rayon_threads(#rayon_threads)
-                .pin_threads(false)
-                .build()
-                .expect("failed to create test runtime");
+    // Check if the function returns a Result (has a non-unit return type)
+    let has_return_type = !matches!(&sig.output, syn::ReturnType::Default);
 
-            __loom_runtime.block_on(async #block);
-            __loom_runtime.block_until_idle();
+    // Generate the test function
+    let output = if has_return_type {
+        // Function returns something (likely Result<()>), capture and return it
+        quote! {
+            #[::core::prelude::v1::test]
+            #(#attrs)*
+            #vis #new_sig {
+                let __loom_runtime = ::loom_rs::LoomBuilder::new()
+                    .prefix(concat!("test-", stringify!(#fn_name)))
+                    .tokio_threads(#tokio_threads)
+                    .rayon_threads(#rayon_threads)
+                    .pin_threads(false)
+                    .build()
+                    .expect("failed to create test runtime");
+
+                let __result = __loom_runtime.block_on(async #block);
+                __loom_runtime.block_until_idle();
+                __result
+            }
+        }
+    } else {
+        // Function returns (), no need to capture
+        quote! {
+            #[::core::prelude::v1::test]
+            #(#attrs)*
+            #vis #new_sig {
+                let __loom_runtime = ::loom_rs::LoomBuilder::new()
+                    .prefix(concat!("test-", stringify!(#fn_name)))
+                    .tokio_threads(#tokio_threads)
+                    .rayon_threads(#rayon_threads)
+                    .pin_threads(false)
+                    .build()
+                    .expect("failed to create test runtime");
+
+                __loom_runtime.block_on(async #block);
+                __loom_runtime.block_until_idle();
+            }
         }
     };
 
