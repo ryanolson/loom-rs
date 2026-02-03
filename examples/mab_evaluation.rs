@@ -49,8 +49,6 @@ struct EvaluationConfig {
     latency_work_us: u64,
     /// Total CPUs to use for evaluation (bounded set)
     total_cpus: usize,
-    /// CPU range string (e.g., "0-15")
-    cpuset: &'static str,
     /// Thread configurations to test
     thread_configs: Vec<ThreadConfig>,
 }
@@ -67,7 +65,6 @@ impl Default for EvaluationConfig {
             latency_work_rate: 500,
             latency_work_us: 500,
             total_cpus: 16,
-            cpuset: "0-15",
             thread_configs: vec![
                 ThreadConfig {
                     name: "minimal-tokio",
@@ -963,9 +960,9 @@ fn measure_config(
     thread_config: &ThreadConfig,
 ) -> Option<ConfigResults> {
     // Try to build runtime with this configuration
+    // Note: cpuset is now automatically discovered from process affinity
     let runtime = match LoomBuilder::new()
         .prefix("mab-eval")
-        .cpuset(eval_config.cpuset)
         .tokio_threads(thread_config.tokio_threads)
         .rayon_threads(thread_config.rayon_threads)
         .build()
@@ -1177,8 +1174,8 @@ fn print_markdown_report(
     // System Configuration Section
     println!("## System Configuration\n");
     println!(
-        "**Evaluation CPUs:** {} ({} cores)\n",
-        eval_config.cpuset, eval_config.total_cpus
+        "**Evaluation CPUs:** {} cores (auto-discovered from process affinity)\n",
+        eval_config.total_cpus
     );
 
     println!("### Thread Configurations Tested\n");

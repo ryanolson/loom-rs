@@ -91,7 +91,6 @@
 //!
 //! ```toml
 //! prefix = "myapp"
-//! cpuset = "0-7,16-23"
 //! tokio_threads = 2
 //! rayon_threads = 14
 //! compute_pool_size = 64
@@ -101,7 +100,6 @@
 //!
 //! With `.env_prefix("LOOM")`:
 //! - `LOOM_PREFIX=myapp`
-//! - `LOOM_CPUSET=0-7`
 //! - `LOOM_TOKIO_THREADS=2`
 //! - `LOOM_RAYON_THREADS=6`
 //!
@@ -125,12 +123,18 @@
 //!     .build()?;
 //! ```
 //!
-//! ## CPU Set Format
+//! ## CPU Affinity
 //!
-//! The `cpuset` option accepts a string in Linux taskset/numactl format:
-//! - Single CPUs: `"0"`, `"5"`
-//! - Ranges: `"0-7"`, `"16-23"`
-//! - Mixed: `"0-3,8-11"`, `"0,2,4,6-8"`
+//! When `pin_threads = true` (the default), loom automatically discovers the
+//! process's allowed CPU set via `sched_getaffinity` on Linux. This respects:
+//! - cgroup CPU constraints (Docker `--cpuset-cpus`, Kubernetes CPU limits)
+//! - taskset restrictions
+//! - NUMA policies
+//!
+//! When using CUDA (`cuda_device` option), the CUDA device's NUMA-local CPUs
+//! are intersected with the process affinity mask.
+//!
+//! Use `runtime.effective_cpuset()` to inspect which CPUs the runtime is using.
 //!
 //! ## CUDA Support
 //!
@@ -169,6 +173,7 @@ pub use builder::{LoomArgs, LoomBuilder};
 pub use config::LoomConfig;
 pub use context::current_runtime;
 pub use error::{LoomError, Result};
+pub use loom_macros::test;
 pub use mab::{Arm, ComputeHint, ComputeHintProvider, MabKnobs, MabScheduler};
 pub use metrics::LoomMetrics;
 pub use runtime::LoomRuntime;

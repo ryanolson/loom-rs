@@ -28,6 +28,15 @@ jobs:
             exit 1
           fi
 
+      - name: Verify loom-macros version matches
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          MACROS_VERSION=$(grep '^version' loom-macros/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$MACROS_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) doesn't match loom-macros/Cargo.toml version ($MACROS_VERSION)"
+            exit 1
+          fi
+
       - name: Run tests
         run: cargo test --features cuda
 
@@ -37,7 +46,15 @@ jobs:
       - name: Check documentation
         run: cargo doc --no-deps
 
-      - name: Publish to crates.io
+      - name: Publish loom-macros to crates.io
+        run: cargo publish --manifest-path loom-macros/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Publish loom-rs to crates.io
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -47,10 +47,17 @@ pub enum LoomError {
     #[error("requested {requested} threads but only {available} CPUs available")]
     InsufficientCpus { requested: usize, available: usize },
 
-    /// Cannot specify both cuda_device and cpuset.
+    /// CUDA device cpuset has no overlap with process affinity mask.
     #[cfg(feature = "cuda")]
-    #[error("cannot specify both cuda_device and cpuset; cuda_device implies its local cpuset")]
-    CudaCpusetConflict,
+    #[error(
+        "CUDA device cpuset {cuda_cpuset} has no overlap with process affinity mask {process_mask}"
+    )]
+    CudaCpusetNoOverlap {
+        /// The CUDA device's local CPU set
+        cuda_cpuset: String,
+        /// The process affinity mask
+        process_mask: String,
+    },
 }
 
 /// Result type alias for Loom operations.

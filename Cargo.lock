@@ -660,6 +660,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-macros"
+version = "0.3.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "loom-rs"
 version = "0.3.1"
 dependencies = [
@@ -672,6 +681,8 @@ dependencies = [
  "futures",
  "futures-core",
  "hwlocality",
+ "libc",
+ "loom-macros",
  "nvml-wrapper",
  "parking_lot",
  "pin-project-lite",

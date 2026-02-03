@@ -34,7 +34,9 @@ use crate::bridge::{
 };
 use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
-use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
+#[cfg(feature = "cuda")]
+use crate::cpuset::intersect_cpusets;
+use crate::cpuset::{available_cpus, format_cpuset, get_process_affinity_mask};
 use crate::error::{LoomError, Result};
 use crate::mab::{Arm, ComputeHint, Context, FunctionKey, MabKnobs, MabScheduler};
 use crate::metrics::LoomMetrics;
@@ -217,6 +219,9 @@ pub(crate) struct LoomRuntimeInner {
     pub(crate) tokio_cpus: Vec<usize>,
     /// CPUs allocated to rayon workers
     pub(crate) rayon_cpus: Vec<usize>,
+    /// The effective CPU set after applying all constraints
+    /// (process affinity, CUDA device locality)
+    pub(crate) effective_cpuset: Vec<usize>,
     /// Lazily initialized shared MAB scheduler
     mab_scheduler: OnceLock<Arc<MabScheduler>>,
     /// MAB knobs configuration
@@ -248,44 +253,74 @@ impl LoomRuntime {
     /// This is typically called via `LoomBuilder::build()`.
     pub(crate) fn from_config(config: LoomConfig) -> Result<Self> {
         let pool_size = config.compute_pool_size;
-        // Determine available CPUs
-        // Priority: CUDA device cpuset > user cpuset > all available CPUs
-        // Error if both cuda_device and cpuset are specified (mutually exclusive)
-        let cpus = {
+
+        // Determine available CPUs based on process affinity and CUDA device
+        //
+        // When pin_threads=true:
+        //   1. Get process affinity mask (respects cgroups/containers)
+        //   2. If CUDA device specified, intersect with CUDA's NUMA cpuset
+        //   3. Error if intersection is empty
+        //
+        // When pin_threads=false:
+        //   Use all available CPUs (no pinning will occur anyway)
+        let cpus = if config.pin_threads {
+            // Get process affinity mask (or fall back to available_cpus)
+            let process_mask = get_process_affinity_mask().unwrap_or_else(|| {
+                debug!("process affinity not available, using all CPUs");
+                available_cpus()
+            });
+            debug!(
+                process_mask = %format_cpuset(&process_mask),
+                "obtained process affinity mask"
+            );
+
             #[cfg(feature = "cuda")]
             {
-                // Check for conflicting configuration first
-                if config.cuda_device.is_some() && config.cpuset.is_some() {
-                    return Err(LoomError::CudaCpusetConflict);
-                }
-
                 if let Some(ref selector) = config.cuda_device {
                     match crate::cuda::cpuset_for_cuda_device(selector)? {
-                        Some(cuda_cpus) => cuda_cpus,
+                        Some(cuda_cpus) => {
+                            debug!(
+                                cuda_cpuset = %format_cpuset(&cuda_cpus),
+                                "obtained CUDA device cpuset"
+                            );
+                            let intersection = intersect_cpusets(&process_mask, &cuda_cpus);
+                            debug!(
+                                intersection = %format_cpuset(&intersection),
+                                "intersected process mask with CUDA cpuset"
+                            );
+                            if intersection.is_empty() {
+                                return Err(LoomError::CudaCpusetNoOverlap {
+                                    cuda_cpuset: format_cpuset(&cuda_cpus),
+                                    process_mask: format_cpuset(&process_mask),
+                                });
+                            }
+                            intersection
+                        }
                         None => {
-                            // Could not determine CUDA locality, fall back to all CPUs
-                            available_cpus()
+                            // Could not determine CUDA locality, use process mask
+                            debug!("CUDA locality not available, using process affinity mask");
+                            process_mask
                         }
                     }
-                } else if let Some(ref cpuset_str) = config.cpuset {
-                    parse_and_validate_cpuset(cpuset_str)?
                 } else {
-                    available_cpus()
+                    process_mask
                 }
             }
             #[cfg(not(feature = "cuda"))]
             {
-                if let Some(ref cpuset_str) = config.cpuset {
-                    parse_and_validate_cpuset(cpuset_str)?
-                } else {
-                    available_cpus()
-                }
+                process_mask
             }
+        } else {
+            // pin_threads=false: no pinning, just use all available CPUs
+            available_cpus()
         };
 
         if cpus.is_empty() {
             return Err(LoomError::NoCpusAvailable);
         }
+
+        // Store the effective cpuset before splitting
+        let effective_cpuset = cpus.clone();
 
         let total_cpus = cpus.len();
         let tokio_threads = config.effective_tokio_threads();
@@ -310,12 +345,15 @@ impl LoomRuntime {
             rayon_cpus.to_vec()
         };
 
+        let pin_threads = config.pin_threads;
+
         info!(
             prefix = %config.prefix,
             tokio_threads,
             rayon_threads,
-            total_cpus,
+            effective_cpuset = %format_cpuset(&effective_cpuset),
             pool_size,
+            pin_threads,
             "building loom runtime"
         );
 
@@ -333,13 +371,19 @@ impl LoomRuntime {
                 tokio_threads,
                 tokio_cpus.clone(),
                 weak_clone.clone(),
+                pin_threads,
             )
             .expect("failed to build tokio runtime");
 
             // Build rayon pool with thread-local injection
-            let rayon_pool =
-                Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus.clone(), weak_clone)
-                    .expect("failed to build rayon pool");
+            let rayon_pool = Self::build_rayon_pool(
+                &prefix,
+                rayon_threads,
+                rayon_cpus.clone(),
+                weak_clone,
+                pin_threads,
+            )
+            .expect("failed to build rayon pool");
 
             // Extract MAB knobs, using defaults if not configured
             let mab_knobs = config.mab_knobs.clone().unwrap_or_default();
@@ -365,6 +409,7 @@ impl LoomRuntime {
                 rayon_threads,
                 tokio_cpus,
                 rayon_cpus,
+                effective_cpuset,
                 mab_scheduler: OnceLock::new(),
                 mab_knobs,
                 prometheus_metrics,
@@ -379,6 +424,7 @@ impl LoomRuntime {
         num_threads: usize,
         cpus: Vec<usize>,
         runtime_weak: Weak<LoomRuntimeInner>,
+        pin_threads: bool,
     ) -> Result<tokio::runtime::Runtime> {
         let allocator = Arc::new(CpuAllocator::new(cpus));
         let prefix_clone = Arc::clone(prefix);
@@ -398,12 +444,14 @@ impl LoomRuntime {
                 format!("{}-tokio-{:04}", name_prefix, id)
             })
             .on_thread_start(move || {
-                // Pin CPU
-                let cpu_id = start_allocator.allocate();
-                if let Err(e) = pin_to_cpu(cpu_id) {
-                    warn!(%e, %start_prefix, cpu_id, "failed to pin tokio thread");
-                } else {
-                    debug!(cpu_id, %start_prefix, "pinned tokio thread to CPU");
+                // Pin CPU (if enabled)
+                if pin_threads {
+                    let cpu_id = start_allocator.allocate();
+                    if let Err(e) = pin_to_cpu(cpu_id) {
+                        warn!(%e, %start_prefix, cpu_id, "failed to pin tokio thread");
+                    } else {
+                        debug!(cpu_id, %start_prefix, "pinned tokio thread to CPU");
+                    }
                 }
 
                 // Inject runtime reference into thread-local
@@ -423,6 +471,7 @@ impl LoomRuntime {
         num_threads: usize,
         cpus: Vec<usize>,
         runtime_weak: Weak<LoomRuntimeInner>,
+        pin_threads: bool,
     ) -> Result<rayon::ThreadPool> {
         let allocator = Arc::new(CpuAllocator::new(cpus));
         let name_prefix = Arc::clone(prefix);
@@ -435,11 +484,13 @@ impl LoomRuntime {
             .num_threads(num_threads)
             .thread_name(move |i| format!("{}-rayon-{:04}", name_prefix, i))
             .start_handler(move |thread_index| {
-                // Pin CPU
-                let cpu_id = start_allocator.allocate();
-                debug!(thread_index, cpu_id, %start_prefix, "rayon thread starting");
-                if let Err(e) = pin_to_cpu(cpu_id) {
-                    warn!(%e, %start_prefix, cpu_id, thread_index, "failed to pin rayon thread");
+                // Pin CPU (if enabled)
+                if pin_threads {
+                    let cpu_id = start_allocator.allocate();
+                    debug!(thread_index, cpu_id, %start_prefix, "rayon thread starting");
+                    if let Err(e) = pin_to_cpu(cpu_id) {
+                        warn!(%e, %start_prefix, cpu_id, thread_index, "failed to pin rayon thread");
+                    }
                 }
 
                 // Inject runtime reference into thread-local
@@ -1073,6 +1124,24 @@ impl LoomRuntime {
     pub fn rayon_cpus(&self) -> &[usize] {
         &self.inner.rayon_cpus
     }
+
+    /// Get the effective CPU set after applying all constraints.
+    ///
+    /// This reflects the CPUs available after considering:
+    /// - Process affinity mask (cgroups/containers via `sched_getaffinity`)
+    /// - CUDA device NUMA locality (if `cuda_device` is configured)
+    ///
+    /// Returns the sorted list of CPU IDs that the runtime is using.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let runtime = LoomBuilder::new().build()?;
+    /// println!("Using CPUs: {:?}", runtime.effective_cpuset());
+    /// ```
+    pub fn effective_cpuset(&self) -> &[usize] {
+        &self.inner.effective_cpuset
+    }
 }
 
 impl LoomRuntimeInner {
@@ -1219,10 +1288,10 @@ mod tests {
     fn test_config() -> LoomConfig {
         LoomConfig {
             prefix: "test".to_string(),
-            cpuset: None,
             tokio_threads: Some(1),
             rayon_threads: Some(1),
             compute_pool_size: DEFAULT_POOL_SIZE,
+            pin_threads: false, // Disable pinning in tests for portability
             #[cfg(feature = "cuda")]
             cuda_device: None,
             mab_knobs: None,
@@ -1310,10 +1379,11 @@ mod tests {
 
     #[test]
     fn test_insufficient_cpus_error() {
+        // Request more threads than available CPUs
+        let available = crate::cpuset::available_cpus().len();
         let mut config = test_config();
-        config.cpuset = Some("0".to_string()); // Only 1 CPU
-        config.tokio_threads = Some(2);
-        config.rayon_threads = Some(2);
+        config.tokio_threads = Some(available + 1);
+        config.rayon_threads = Some(available + 1);
 
         let result = LoomRuntime::from_config(config);
         assert!(matches!(result, Err(LoomError::InsufficientCpus { .. })));
@@ -1419,41 +1489,29 @@ mod tests {
     }
 
     #[test]
-    fn test_cpuset_only() {
-        let mut config = test_config();
-        config.cpuset = Some("0".to_string());
-        config.tokio_threads = Some(1);
-        config.rayon_threads = Some(0);
-
+    fn test_effective_cpuset_getter() {
+        let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
-        // Should use the user-provided cpuset
-        assert_eq!(runtime.inner.tokio_cpus, vec![0]);
-    }
-
-    /// Test that CUDA cpuset conflict error is properly detected.
-    /// This test requires actual CUDA hardware to verify the conflict.
-    #[cfg(feature = "cuda-tests")]
-    #[test]
-    fn test_cuda_cpuset_conflict_error() {
-        let mut config = test_config();
-        config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
-        config.cpuset = Some("0".to_string()); // Conflict: both specified
-
-        let result = LoomRuntime::from_config(config);
-        assert!(
-            matches!(result, Err(LoomError::CudaCpusetConflict)),
-            "expected CudaCpusetConflict error, got {:?}",
-            result
+        // effective_cpuset should return a non-empty slice
+        let cpuset = runtime.effective_cpuset();
+        assert!(!cpuset.is_empty(), "effective_cpuset should not be empty");
+        // Should be sorted
+        let mut sorted = cpuset.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            cpuset,
+            sorted.as_slice(),
+            "effective_cpuset should be sorted"
         );
     }
 
-    /// Test that CUDA device alone (without cpuset) works.
+    /// Test that CUDA device works and uses process affinity intersection.
     #[cfg(feature = "cuda-tests")]
     #[test]
-    fn test_cuda_device_only() {
+    fn test_cuda_device_with_affinity() {
         let mut config = test_config();
         config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
-        config.cpuset = None;
+        config.pin_threads = true;
 
         let runtime = LoomRuntime::from_config(config).unwrap();
         // Should have found CUDA-local CPUs
