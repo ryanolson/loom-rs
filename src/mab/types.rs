@@ -43,6 +43,24 @@ impl FunctionKey {
         s.hash(&mut hasher);
         FunctionKey(hasher.finish())
     }
+
+    /// Create a function key from a type's name, without requiring `'static`.
+    ///
+    /// This is useful for scoped closures where the type captures non-`'static`
+    /// references. Uses `std::any::type_name` which works on any type.
+    ///
+    /// Note: Type names are not guaranteed to be stable across compiler versions,
+    /// but this is fine for runtime-only MAB learning that doesn't persist.
+    ///
+    /// ```ignore
+    /// let key = FunctionKey::from_type_name::<MyHandler>();
+    /// ```
+    pub fn from_type_name<T: ?Sized>() -> Self {
+        let type_name = std::any::type_name::<T>();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        type_name.hash(&mut hasher);
+        FunctionKey(hasher.finish())
+    }
 }
 
 /// The two arms of the bandit: inline execution on Tokio or offload to Rayon.

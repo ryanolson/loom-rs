@@ -361,8 +361,7 @@ impl LoomBuilder {
     pub fn build(self) -> Result<LoomRuntime> {
         let mut config: LoomConfig = self.figment.extract().map_err(Box::new)?;
         config.prometheus_registry = self.prometheus_registry;
-        let pool_size = config.compute_pool_size;
-        LoomRuntime::from_config(config, pool_size)
+        LoomRuntime::from_config(config)
     }
 }
 

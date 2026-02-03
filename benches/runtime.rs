@@ -360,6 +360,102 @@ fn bench_ergonomic_spawn_compute(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark scope_compute() overhead.
+fn bench_scope_compute(c: &mut Criterion) {
+    let runtime = create_runtime();
+
+    let mut group = c.benchmark_group("scope_compute");
+
+    // Minimal work - shows pure overhead
+    group.bench_function("minimal_work", |b| {
+        b.iter(|| runtime.block_on(async { runtime.scope_compute(|_s| minimal_work()).await }));
+    });
+
+    // Small work (~100ns)
+    group.bench_function("small_work", |b| {
+        b.iter(|| runtime.block_on(async { runtime.scope_compute(|_s| small_work()).await }));
+    });
+
+    // Medium work (~1µs)
+    group.bench_function("medium_work", |b| {
+        b.iter(|| runtime.block_on(async { runtime.scope_compute(|_s| medium_work()).await }));
+    });
+
+    // Borrowing local data - key use case
+    group.bench_function("borrow_local_data", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
+                runtime
+                    .scope_compute(|_s| black_box(data.iter().sum::<u64>()))
+                    .await
+            })
+        });
+    });
+
+    // With parallel spawns
+    group.bench_function("parallel_spawns", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
+                let sum = AtomicU64::new(0);
+
+                runtime
+                    .scope_compute(|s| {
+                        let (left, right) = data.split_at(data.len() / 2);
+                        let sum_ref = &sum;
+
+                        s.spawn(move |_| {
+                            sum_ref.fetch_add(left.iter().sum::<u64>(), Ordering::Relaxed);
+                        });
+                        s.spawn(move |_| {
+                            sum_ref.fetch_add(right.iter().sum::<u64>(), Ordering::Relaxed);
+                        });
+                    })
+                    .await;
+
+                black_box(sum.load(Ordering::Relaxed))
+            })
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark scope_compute vs spawn_compute to show the tradeoff.
+fn bench_scope_vs_spawn_compute(c: &mut Criterion) {
+    let runtime = create_runtime();
+
+    let mut group = c.benchmark_group("scope_vs_spawn_compute");
+
+    // spawn_compute with owned data (must clone or Arc)
+    group.bench_function("spawn_compute_owned", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
+                runtime
+                    .spawn_compute(move || black_box(data.iter().sum::<u64>()))
+                    .await
+            })
+        });
+    });
+
+    // scope_compute with borrowed data (no clone needed)
+    group.bench_function("scope_compute_borrowed", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
+                runtime
+                    .scope_compute(|_s| black_box(data.iter().sum::<u64>()))
+                    .await
+            })
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_spawn_compute,
@@ -373,6 +469,8 @@ criterion_group!(
     bench_spawn_compute_pooling,
     bench_current_runtime,
     bench_ergonomic_spawn_compute,
+    bench_scope_compute,
+    bench_scope_vs_spawn_compute,
 );
 
 criterion_main!(benches);

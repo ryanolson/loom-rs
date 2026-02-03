@@ -588,7 +588,7 @@ mod tests {
     }
 
     fn test_runtime() -> LoomRuntime {
-        LoomRuntime::from_config(test_config(), DEFAULT_POOL_SIZE).unwrap()
+        LoomRuntime::from_config(test_config()).unwrap()
     }
 
     #[test]
