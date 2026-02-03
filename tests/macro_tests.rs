@@ -16,27 +16,27 @@ async fn test_current_runtime_available() {
 }
 
 /// Test custom tokio thread count
-#[loom_rs::test(tokio_thread_count = 2)]
+#[loom_rs::test(tokio_thread_count = 2, rayon_thread_count = 1)]
 async fn test_custom_tokio_threads() {
     let runtime = loom_rs::current_runtime().expect("runtime should be available");
     assert_eq!(runtime.tokio_threads(), 2);
-    assert_eq!(runtime.rayon_threads(), 2); // Default
+    assert_eq!(runtime.rayon_threads(), 1);
 }
 
 /// Test custom rayon thread count
-#[loom_rs::test(rayon_thread_count = 3)]
+#[loom_rs::test(rayon_thread_count = 2)]
 async fn test_custom_rayon_threads() {
     let runtime = loom_rs::current_runtime().expect("runtime should be available");
     assert_eq!(runtime.tokio_threads(), 1); // Default
-    assert_eq!(runtime.rayon_threads(), 3);
+    assert_eq!(runtime.rayon_threads(), 2);
 }
 
-/// Test both custom thread counts
-#[loom_rs::test(tokio_thread_count = 2, rayon_thread_count = 2)]
+/// Test both custom thread counts (max 3 CPUs for CI compatibility)
+#[loom_rs::test(tokio_thread_count = 2, rayon_thread_count = 1)]
 async fn test_custom_both_thread_counts() {
     let runtime = loom_rs::current_runtime().expect("runtime should be available");
     assert_eq!(runtime.tokio_threads(), 2);
-    assert_eq!(runtime.rayon_threads(), 2);
+    assert_eq!(runtime.rayon_threads(), 1);
 }
 
 /// Test spawn_async works
