@@ -372,3 +372,92 @@ where
         .scope_compute(f)
         .await
 }
+
+/// Execute scoped work with adaptive sync/async decision using the current runtime.
+///
+/// This is a convenience function for `loom_rs::current_runtime().unwrap().scope_adaptive(f)`.
+/// Uses MAB (Multi-Armed Bandit) to learn whether to run synchronously via `install()`
+/// or asynchronously via `scope_compute()`.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context.
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::LoomBuilder;
+/// use std::sync::atomic::{AtomicI32, Ordering};
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+///     let sum = AtomicI32::new(0);
+///
+///     // MAB learns whether this scoped work should be sync or async
+///     loom_rs::scope_adaptive(|s| {
+///         let (left, right) = data.split_at(data.len() / 2);
+///         let sum_ref = &sum;
+///
+///         s.spawn(move |_| {
+///             sum_ref.fetch_add(left.iter().sum::<i32>(), Ordering::Relaxed);
+///         });
+///         s.spawn(move |_| {
+///             sum_ref.fetch_add(right.iter().sum::<i32>(), Ordering::Relaxed);
+///         });
+///     }).await;
+/// });
+/// ```
+pub async fn scope_adaptive<'env, F, R>(f: F) -> R
+where
+    F: FnOnce(&Scope<'env>) -> R + Send + 'env,
+    R: Send + 'env,
+{
+    current_runtime()
+        .expect("scope_adaptive called outside loom runtime")
+        .scope_adaptive(f)
+        .await
+}
+
+/// Execute scoped work with adaptive decision and hint using the current runtime.
+///
+/// Like `scope_adaptive()`, but provides a hint to guide cold-start behavior.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context.
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::{LoomBuilder, ComputeHint};
+/// use std::sync::atomic::{AtomicI32, Ordering};
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     let data = vec![1, 2, 3, 4];
+///     let sum = AtomicI32::new(0);
+///
+///     // Hint that this is likely fast work
+///     loom_rs::scope_adaptive_with_hint(ComputeHint::Low, |s| {
+///         let sum_ref = &sum;
+///         for &val in &data {
+///             s.spawn(move |_| {
+///                 sum_ref.fetch_add(val, Ordering::Relaxed);
+///             });
+///         }
+///     }).await;
+/// });
+/// ```
+pub async fn scope_adaptive_with_hint<'env, F, R>(hint: ComputeHint, f: F) -> R
+where
+    F: FnOnce(&Scope<'env>) -> R + Send + 'env,
+    R: Send + 'env,
+{
+    current_runtime()
+        .expect("scope_adaptive_with_hint called outside loom runtime")
+        .scope_adaptive_with_hint(hint, f)
+        .await
+}

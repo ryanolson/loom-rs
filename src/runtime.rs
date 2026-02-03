@@ -191,6 +191,7 @@ impl Drop for ComputeTaskGuard {
 /// // Graceful shutdown from main thread
 /// runtime.block_until_idle();
 /// ```
+#[derive(Clone)]
 pub struct LoomRuntime {
     pub(crate) inner: Arc<LoomRuntimeInner>,
 }
@@ -467,6 +468,11 @@ impl LoomRuntime {
     /// Zero overhead - returns a reference.
     pub fn tokio_handle(&self) -> &tokio::runtime::Handle {
         self.inner.tokio_runtime.handle()
+    }
+
+    /// Get the tokio runtime.
+    pub fn tokio_runtime(&self) -> &tokio::runtime::Runtime {
+        &self.inner.tokio_runtime
     }
 
     /// Get the rayon thread pool.
