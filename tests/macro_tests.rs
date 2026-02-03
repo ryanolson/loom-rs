@@ -24,19 +24,19 @@ async fn test_custom_tokio_threads() {
 }
 
 /// Test custom rayon thread count
-#[loom_rs::test(rayon_thread_count = 4)]
+#[loom_rs::test(rayon_thread_count = 3)]
 async fn test_custom_rayon_threads() {
     let runtime = loom_rs::current_runtime().expect("runtime should be available");
     assert_eq!(runtime.tokio_threads(), 1); // Default
-    assert_eq!(runtime.rayon_threads(), 4);
+    assert_eq!(runtime.rayon_threads(), 3);
 }
 
 /// Test both custom thread counts
-#[loom_rs::test(tokio_thread_count = 2, rayon_thread_count = 4)]
+#[loom_rs::test(tokio_thread_count = 2, rayon_thread_count = 2)]
 async fn test_custom_both_thread_counts() {
     let runtime = loom_rs::current_runtime().expect("runtime should be available");
     assert_eq!(runtime.tokio_threads(), 2);
-    assert_eq!(runtime.rayon_threads(), 4);
+    assert_eq!(runtime.rayon_threads(), 2);
 }
 
 /// Test spawn_async works
