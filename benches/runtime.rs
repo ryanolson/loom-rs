@@ -385,7 +385,7 @@ fn bench_scope_compute(c: &mut Criterion) {
     group.bench_function("borrow_local_data", |b| {
         b.iter(|| {
             runtime.block_on(async {
-                let data = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
                 runtime
                     .scope_compute(|_s| black_box(data.iter().sum::<u64>()))
                     .await
@@ -398,7 +398,7 @@ fn bench_scope_compute(c: &mut Criterion) {
         b.iter(|| {
             runtime.block_on(async {
                 use std::sync::atomic::{AtomicU64, Ordering};
-                let data = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
                 let sum = AtomicU64::new(0);
 
                 runtime
@@ -433,7 +433,7 @@ fn bench_scope_vs_spawn_compute(c: &mut Criterion) {
     group.bench_function("spawn_compute_owned", |b| {
         b.iter(|| {
             runtime.block_on(async {
-                let data = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
                 runtime
                     .spawn_compute(move || black_box(data.iter().sum::<u64>()))
                     .await
@@ -445,7 +445,7 @@ fn bench_scope_vs_spawn_compute(c: &mut Criterion) {
     group.bench_function("scope_compute_borrowed", |b| {
         b.iter(|| {
             runtime.block_on(async {
-                let data = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
+                let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
                 runtime
                     .scope_compute(|_s| black_box(data.iter().sum::<u64>()))
                     .await

@@ -1556,7 +1556,7 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
-            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let data = [1, 2, 3, 4, 5, 6, 7, 8];
 
             let sum = runtime
                 .scope_compute(|_s| {
@@ -1582,7 +1582,7 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
-            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let data = [1, 2, 3, 4, 5, 6, 7, 8];
             let sum = AtomicI32::new(0);
 
             runtime
@@ -1615,7 +1615,7 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
-            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let data = [1, 2, 3, 4, 5, 6, 7, 8];
             let sum = AtomicI32::new(0);
 
             runtime
@@ -1653,7 +1653,7 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
-            let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+            let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
             runtime
                 .scope_compute(|_s| {
@@ -1765,7 +1765,7 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
-            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let data = [1, 2, 3, 4, 5, 6, 7, 8];
             let sum = AtomicI32::new(0);
 
             runtime
@@ -1877,7 +1877,7 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
-            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let data = [1, 2, 3, 4, 5, 6, 7, 8];
 
             let sum = runtime
                 .scope_adaptive(|_s| {
@@ -1903,7 +1903,7 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
-            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let data = [1, 2, 3, 4, 5, 6, 7, 8];
             let sum = AtomicI32::new(0);
 
             runtime
