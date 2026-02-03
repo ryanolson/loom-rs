@@ -1792,42 +1792,47 @@ mod tests {
     /// This validates the future correctly returns Poll::Pending and wakes up when done.
     #[test]
     fn test_scope_compute_yields_to_executor() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
         use std::sync::Arc;
         use std::time::Duration;
+        use tokio::sync::Notify;
 
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
-            let concurrent_task_ran = Arc::new(AtomicBool::new(false));
-            let concurrent_task_ran_clone = concurrent_task_ran.clone();
+            // Notify for scope_compute -> async task (sync notify, async wait)
+            let scope_started = Arc::new(Notify::new());
+            let scope_started_clone = scope_started.clone();
 
-            // Spawn a concurrent async task that should run while scope_compute is waiting
+            // Channel for async task -> scope_compute (non-blocking send, blocking recv)
+            let (async_responded_tx, async_responded_rx) = mpsc::channel();
+
+            // Spawn async task that waits for scope_compute to start, then responds
             let concurrent_handle = runtime.spawn_async(async move {
-                // Wait a bit for the scope_compute to start
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                concurrent_task_ran_clone.store(true, Ordering::Release);
+                // Wait for scope_compute to signal it started (async wait - doesn't block tokio)
+                scope_started_clone.notified().await;
+                // Signal back that we received it (non-blocking send)
+                async_responded_tx.send(()).unwrap();
                 100
             });
 
-            // Run scope_compute with work that takes some time
+            // Run scope_compute with round-trip handshake
+            // Move receiver into the closure (FnOnce) so it's owned, not borrowed
             let result = runtime
-                .scope_compute(|_s| {
-                    // Simulate some work
-                    std::thread::sleep(Duration::from_millis(20));
+                .scope_compute(move |_s| {
+                    // Signal that we've started (wakes the async task)
+                    scope_started.notify_one();
+                    // Wait for async task to respond (blocking recv on rayon thread is fine)
+                    // If tokio didn't yield, async task can't respond, and this times out
+                    async_responded_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("Async task should respond - executor may not be yielding");
                     42
                 })
                 .await;
 
             assert_eq!(result, 42);
-
-            // Verify the concurrent task actually ran during scope_compute
-            // (check BEFORE awaiting the handle to prove it ran concurrently)
-            assert!(
-                concurrent_task_ran.load(Ordering::Acquire),
-                "Concurrent task should have run while scope_compute was in progress"
-            );
 
             // The concurrent task should have completed
             let concurrent_result = concurrent_handle.await.unwrap();
