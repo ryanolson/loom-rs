@@ -1,10 +1,11 @@
 [package]
 name = "loom-macros"
-version = "0.3.1"
+version = "0.1.0"
 edition = "2021"
 description = "Procedural macros for loom-rs runtime"
 license = "MIT"
 repository = "https://github.com/ryanolson/loom-rs"
+readme = "README.md"
 keywords = ["async", "runtime", "threadpool", "macro"]
 categories = ["asynchronous", "development-tools::procedural-macro-helpers"]
 

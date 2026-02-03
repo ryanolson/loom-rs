@@ -1,3 +1,5 @@
+#![deny(unreachable_pub)]
+
 //! # loom-rs
 //!
 //! **Weaving multiple threads together**

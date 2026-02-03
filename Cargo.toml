@@ -12,7 +12,7 @@ categories = ["asynchronous", "concurrency"]
 members = ["loom-macros"]
 
 [dependencies]
-loom-macros = { path = "loom-macros", version = "0.3.1" }
+loom-macros = { path = "loom-macros", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 rayon = "1.10"

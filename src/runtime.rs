@@ -15,7 +15,7 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                     LoomRuntime                              │
-//! │  pools: ComputePoolRegistry (per-type lock-free pools)      │
+//! │  pools: TaskStatePool (per-type lock-free pools)            │
 //! │  (One pool per result type, shared across all threads)      │
 //! └─────────────────────────────────────────────────────────────┘
 //!          │ on_thread_start           │ start_handler
@@ -40,7 +40,7 @@ use crate::cpuset::{available_cpus, format_cpuset, get_process_affinity_mask};
 use crate::error::{LoomError, Result};
 use crate::mab::{Arm, ComputeHint, Context, FunctionKey, MabKnobs, MabScheduler};
 use crate::metrics::LoomMetrics;
-use crate::pool::ComputePoolRegistry;
+use crate::pool::TaskStatePool;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,7 +117,7 @@ pub(crate) struct LoomRuntimeInner {
     /// Track in-flight rayon tasks for graceful shutdown
     compute_state: ComputeTaskState,
     /// Per-type object pools for zero-allocation spawn_compute
-    pub(crate) pools: ComputePoolRegistry,
+    pub(crate) pools: TaskStatePool,
     /// Number of tokio worker threads
     pub(crate) tokio_threads: usize,
     /// Number of rayon worker threads
@@ -311,7 +311,7 @@ impl LoomRuntime {
                 rayon_pool,
                 task_tracker: TaskTracker::new(),
                 compute_state: ComputeTaskState::new(),
-                pools: ComputePoolRegistry::new(pool_size),
+                pools: TaskStatePool::new(pool_size),
                 tokio_threads,
                 rayon_threads,
                 tokio_cpus,
@@ -1056,7 +1056,7 @@ impl LoomRuntimeInner {
     ///
     /// Uses per-type object pools for zero allocation after warmup.
     #[inline]
-    pub async fn spawn_compute<F, R>(self: &Arc<Self>, f: F) -> R
+    pub(crate) async fn spawn_compute<F, R>(self: &Arc<Self>, f: F) -> R
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -1105,7 +1105,7 @@ impl LoomRuntimeInner {
     /// 4. Therefore, `'env` references outlive all accesses to borrowed data
     ///
     /// This is the same safety argument used by `std::thread::scope`.
-    pub async fn scope_compute<'env, F, R>(self: &Arc<Self>, f: F) -> R
+    pub(crate) async fn scope_compute<'env, F, R>(self: &Arc<Self>, f: F) -> R
     where
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
