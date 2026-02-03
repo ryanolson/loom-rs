@@ -1,3 +1,5 @@
+#![deny(unreachable_pub)]
+
 //! # loom-rs
 //!
 //! **Weaving multiple threads together**
@@ -91,7 +93,6 @@
 //!
 //! ```toml
 //! prefix = "myapp"
-//! cpuset = "0-7,16-23"
 //! tokio_threads = 2
 //! rayon_threads = 14
 //! compute_pool_size = 64
@@ -101,7 +102,6 @@
 //!
 //! With `.env_prefix("LOOM")`:
 //! - `LOOM_PREFIX=myapp`
-//! - `LOOM_CPUSET=0-7`
 //! - `LOOM_TOKIO_THREADS=2`
 //! - `LOOM_RAYON_THREADS=6`
 //!
@@ -125,12 +125,18 @@
 //!     .build()?;
 //! ```
 //!
-//! ## CPU Set Format
+//! ## CPU Affinity
 //!
-//! The `cpuset` option accepts a string in Linux taskset/numactl format:
-//! - Single CPUs: `"0"`, `"5"`
-//! - Ranges: `"0-7"`, `"16-23"`
-//! - Mixed: `"0-3,8-11"`, `"0,2,4,6-8"`
+//! When `pin_threads = true` (the default), loom automatically discovers the
+//! process's allowed CPU set via `sched_getaffinity` on Linux. This respects:
+//! - cgroup CPU constraints (Docker `--cpuset-cpus`, Kubernetes CPU limits)
+//! - taskset restrictions
+//! - NUMA policies
+//!
+//! When using CUDA (`cuda_device` option), the CUDA device's NUMA-local CPUs
+//! are intersected with the process affinity mask.
+//!
+//! Use `runtime.effective_cpuset()` to inspect which CPUs the runtime is using.
 //!
 //! ## CUDA Support
 //!
@@ -169,6 +175,7 @@ pub use builder::{LoomArgs, LoomBuilder};
 pub use config::LoomConfig;
 pub use context::current_runtime;
 pub use error::{LoomError, Result};
+pub use loom_macros::test;
 pub use mab::{Arm, ComputeHint, ComputeHintProvider, MabKnobs, MabScheduler};
 pub use metrics::LoomMetrics;
 pub use runtime::LoomRuntime;
@@ -370,5 +377,94 @@ where
     current_runtime()
         .expect("scope_compute called outside loom runtime")
         .scope_compute(f)
+        .await
+}
+
+/// Execute scoped work with adaptive sync/async decision using the current runtime.
+///
+/// This is a convenience function for `loom_rs::current_runtime().unwrap().scope_adaptive(f)`.
+/// Uses MAB (Multi-Armed Bandit) to learn whether to run synchronously via `install()`
+/// or asynchronously via `scope_compute()`.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context.
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::LoomBuilder;
+/// use std::sync::atomic::{AtomicI32, Ordering};
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+///     let sum = AtomicI32::new(0);
+///
+///     // MAB learns whether this scoped work should be sync or async
+///     loom_rs::scope_adaptive(|s| {
+///         let (left, right) = data.split_at(data.len() / 2);
+///         let sum_ref = &sum;
+///
+///         s.spawn(move |_| {
+///             sum_ref.fetch_add(left.iter().sum::<i32>(), Ordering::Relaxed);
+///         });
+///         s.spawn(move |_| {
+///             sum_ref.fetch_add(right.iter().sum::<i32>(), Ordering::Relaxed);
+///         });
+///     }).await;
+/// });
+/// ```
+pub async fn scope_adaptive<'env, F, R>(f: F) -> R
+where
+    F: FnOnce(&Scope<'env>) -> R + Send + 'env,
+    R: Send + 'env,
+{
+    current_runtime()
+        .expect("scope_adaptive called outside loom runtime")
+        .scope_adaptive(f)
+        .await
+}
+
+/// Execute scoped work with adaptive decision and hint using the current runtime.
+///
+/// Like `scope_adaptive()`, but provides a hint to guide cold-start behavior.
+///
+/// # Panics
+///
+/// Panics if called outside a loom runtime context.
+///
+/// # Example
+///
+/// ```ignore
+/// use loom_rs::{LoomBuilder, ComputeHint};
+/// use std::sync::atomic::{AtomicI32, Ordering};
+///
+/// let runtime = LoomBuilder::new().build()?;
+///
+/// runtime.block_on(async {
+///     let data = vec![1, 2, 3, 4];
+///     let sum = AtomicI32::new(0);
+///
+///     // Hint that this is likely fast work
+///     loom_rs::scope_adaptive_with_hint(ComputeHint::Low, |s| {
+///         let sum_ref = &sum;
+///         for &val in &data {
+///             s.spawn(move |_| {
+///                 sum_ref.fetch_add(val, Ordering::Relaxed);
+///             });
+///         }
+///     }).await;
+/// });
+/// ```
+pub async fn scope_adaptive_with_hint<'env, F, R>(hint: ComputeHint, f: F) -> R
+where
+    F: FnOnce(&Scope<'env>) -> R + Send + 'env,
+    R: Send + 'env,
+{
+    current_runtime()
+        .expect("scope_adaptive_with_hint called outside loom runtime")
+        .scope_adaptive_with_hint(hint, f)
         .await
 }

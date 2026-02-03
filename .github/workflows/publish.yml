@@ -28,6 +28,20 @@ jobs:
             exit 1
           fi
 
+      - name: Check if loom-macros needs publishing
+        id: check-macros
+        run: |
+          MACROS_VERSION=$(grep '^version' loom-macros/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "macros_version=$MACROS_VERSION" >> $GITHUB_OUTPUT
+          # Check if this version is already published on crates.io
+          if cargo search loom-macros --limit 1 | grep -q "loom-macros = \"$MACROS_VERSION\""; then
+            echo "loom-macros $MACROS_VERSION is already published, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "loom-macros $MACROS_VERSION needs to be published"
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run tests
         run: cargo test --features cuda
 
@@ -37,7 +51,17 @@ jobs:
       - name: Check documentation
         run: cargo doc --no-deps
 
-      - name: Publish to crates.io
+      - name: Publish loom-macros to crates.io
+        if: steps.check-macros.outputs.skip != 'true'
+        run: cargo publish --manifest-path loom-macros/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update
+        if: steps.check-macros.outputs.skip != 'true'
+        run: sleep 30
+
+      - name: Publish loom-rs to crates.io
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

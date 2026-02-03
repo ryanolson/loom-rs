@@ -92,7 +92,6 @@ Configuration sources are merged in order (later sources override earlier):
 
 ```toml
 prefix = "myapp"
-cpuset = "0-7,16-23"
 tokio_threads = 2
 rayon_threads = 14
 ```
@@ -103,7 +102,6 @@ With `.env_prefix("LOOM")`:
 
 ```bash
 export LOOM_PREFIX=myapp
-export LOOM_CPUSET=0-7
 export LOOM_TOKIO_THREADS=2
 export LOOM_RAYON_THREADS=6
 ```
@@ -133,18 +131,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Available CLI arguments:
 - `--loom-prefix`: Thread name prefix
-- `--loom-cpuset`: CPU set (e.g., "0-7,16-23")
 - `--loom-tokio-threads`: Number of tokio threads
 - `--loom-rayon-threads`: Number of rayon threads
 - `--loom-cuda-device`: CUDA device ID or UUID (requires `cuda` feature)
 
-## CPU Set Format
+## CPU Affinity
 
-The `cpuset` option accepts a string in Linux taskset/numactl format:
+When `pin_threads = true` (the default), loom automatically discovers the
+process's allowed CPU set via `sched_getaffinity` on Linux. This respects:
 
-- Single CPUs: `"0"`, `"5"`
-- Ranges: `"0-7"`, `"16-23"`
-- Mixed: `"0-3,8-11"`, `"0,2,4,6-8"`
+- **cgroup CPU constraints**: Docker `--cpuset-cpus`, Kubernetes CPU limits
+- **taskset restrictions**: `taskset -c 0-3 ./myapp`
+- **NUMA policies**: `numactl --cpunodebind=0`
+
+When using CUDA (`cuda_device` option), the CUDA device's NUMA-local CPUs
+are intersected with the process affinity mask to ensure optimal data locality.
+
+Use `runtime.effective_cpuset()` to inspect which CPUs the runtime is using:
+
+```rust
+let runtime = LoomBuilder::new().build()?;
+println!("Using CPUs: {:?}", runtime.effective_cpuset());
+```
 
 ## CUDA Support
 

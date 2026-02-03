@@ -135,16 +135,6 @@ impl LoomBuilder {
         self
     }
 
-    /// Set the CPU set string.
-    ///
-    /// Format: `"0-7,16-23"` for ranges, `"0,2,4,6"` for individual CPUs.
-    pub fn cpuset(mut self, cpuset: impl Into<String>) -> Self {
-        self.figment = self
-            .figment
-            .merge(Serialized::default("cpuset", cpuset.into()));
-        self
-    }
-
     /// Set the number of tokio worker threads.
     ///
     /// Default is 1 thread.
@@ -158,6 +148,25 @@ impl LoomBuilder {
     /// Default is the remaining CPUs after tokio threads are allocated.
     pub fn rayon_threads(mut self, n: usize) -> Self {
         self.figment = self.figment.merge(Serialized::default("rayon_threads", n));
+        self
+    }
+
+    /// Enable or disable thread pinning to CPUs.
+    ///
+    /// When enabled (default), threads are pinned to specific CPUs for
+    /// consistent performance. Disable for testing or environments where
+    /// pinning is not desired.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Disable pinning for tests
+    /// let runtime = LoomBuilder::new()
+    ///     .pin_threads(false)
+    ///     .build()?;
+    /// ```
+    pub fn pin_threads(mut self, pin: bool) -> Self {
+        self.figment = self.figment.merge(Serialized::default("pin_threads", pin));
         self
     }
 
@@ -314,11 +323,6 @@ impl LoomBuilder {
                 .figment
                 .merge(Serialized::default("prefix", prefix.clone()));
         }
-        if let Some(ref cpuset) = args.loom_cpuset {
-            self.figment = self
-                .figment
-                .merge(Serialized::default("cpuset", cpuset.clone()));
-        }
         if let Some(threads) = args.loom_tokio_threads {
             self.figment = self
                 .figment
@@ -394,10 +398,6 @@ pub struct LoomArgs {
     #[arg(long)]
     pub loom_prefix: Option<String>,
 
-    /// CPU set (e.g., "0-7,16-23")
-    #[arg(long)]
-    pub loom_cpuset: Option<String>,
-
     /// Number of tokio worker threads
     #[arg(long)]
     pub loom_tokio_threads: Option<usize>,
@@ -420,16 +420,15 @@ mod tests {
     fn test_builder_defaults() {
         let config: LoomConfig = LoomBuilder::new().figment.extract().unwrap();
         assert_eq!(config.prefix, "loom");
-        assert!(config.cpuset.is_none());
         assert!(config.tokio_threads.is_none());
         assert!(config.rayon_threads.is_none());
+        assert!(config.pin_threads, "pin_threads should default to true");
     }
 
     #[test]
     fn test_builder_programmatic_override() {
         let config: LoomConfig = LoomBuilder::new()
             .prefix("myapp")
-            .cpuset("0-3")
             .tokio_threads(2)
             .rayon_threads(6)
             .figment
@@ -437,7 +436,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.prefix, "myapp");
-        assert_eq!(config.cpuset, Some("0-3".to_string()));
         assert_eq!(config.tokio_threads, Some(2));
         assert_eq!(config.rayon_threads, Some(6));
     }
@@ -446,7 +444,6 @@ mod tests {
     fn test_builder_cli_args() {
         let args = LoomArgs {
             loom_prefix: Some("cliapp".to_string()),
-            loom_cpuset: Some("4-7".to_string()),
             loom_tokio_threads: Some(1),
             loom_rayon_threads: Some(3),
             #[cfg(feature = "cuda")]
@@ -462,7 +459,6 @@ mod tests {
 
         // CLI args should override programmatic values
         assert_eq!(config.prefix, "cliapp");
-        assert_eq!(config.cpuset, Some("4-7".to_string()));
         assert_eq!(config.tokio_threads, Some(1));
         assert_eq!(config.rayon_threads, Some(3));
     }
@@ -471,7 +467,6 @@ mod tests {
     fn test_builder_partial_cli_args() {
         let args = LoomArgs {
             loom_prefix: Some("cliapp".to_string()),
-            loom_cpuset: None,
             loom_tokio_threads: None,
             loom_rayon_threads: None,
             #[cfg(feature = "cuda")]
@@ -480,7 +475,7 @@ mod tests {
 
         let config: LoomConfig = LoomBuilder::new()
             .prefix("original")
-            .cpuset("0-3")
+            .tokio_threads(2)
             .with_cli_args(&args)
             .figment
             .extract()
@@ -488,6 +483,29 @@ mod tests {
 
         // Only prefix should be overridden
         assert_eq!(config.prefix, "cliapp");
-        assert_eq!(config.cpuset, Some("0-3".to_string()));
+        assert_eq!(config.tokio_threads, Some(2));
+    }
+
+    #[test]
+    fn test_builder_pin_threads() {
+        // Default should be true
+        let config: LoomConfig = LoomBuilder::new().figment.extract().unwrap();
+        assert!(config.pin_threads);
+
+        // Can be set to false
+        let config: LoomConfig = LoomBuilder::new()
+            .pin_threads(false)
+            .figment
+            .extract()
+            .unwrap();
+        assert!(!config.pin_threads);
+
+        // Can be explicitly set to true
+        let config: LoomConfig = LoomBuilder::new()
+            .pin_threads(true)
+            .figment
+            .extract()
+            .unwrap();
+        assert!(config.pin_threads);
     }
 }

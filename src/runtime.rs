@@ -15,7 +15,7 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                     LoomRuntime                              │
-//! │  pools: ComputePoolRegistry (per-type lock-free pools)      │
+//! │  pools: TaskStatePool (per-type lock-free pools)            │
 //! │  (One pool per result type, shared across all threads)      │
 //! └─────────────────────────────────────────────────────────────┘
 //!          │ on_thread_start           │ start_handler
@@ -34,11 +34,13 @@ use crate::bridge::{
 };
 use crate::config::LoomConfig;
 use crate::context::{clear_current_runtime, set_current_runtime};
-use crate::cpuset::{available_cpus, format_cpuset, parse_and_validate_cpuset};
+#[cfg(feature = "cuda")]
+use crate::cpuset::intersect_cpusets;
+use crate::cpuset::{available_cpus, format_cpuset, get_process_affinity_mask};
 use crate::error::{LoomError, Result};
 use crate::mab::{Arm, ComputeHint, Context, FunctionKey, MabKnobs, MabScheduler};
 use crate::metrics::LoomMetrics;
-use crate::pool::ComputePoolRegistry;
+use crate::pool::TaskStatePool;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,99 +49,6 @@ use std::time::Instant;
 use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
-
-/// State for tracking in-flight compute tasks.
-///
-/// Combines the task counter with a notification mechanism for efficient
-/// shutdown waiting (avoids spin loops).
-struct ComputeTaskState {
-    /// Number of tasks currently executing on rayon
-    count: AtomicUsize,
-    /// Notified when count reaches 0
-    notify: Notify,
-}
-
-impl ComputeTaskState {
-    fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            notify: Notify::new(),
-        }
-    }
-}
-
-/// Guard for tracking async task metrics.
-///
-/// Panic-safe: task_completed is called even if the future panics.
-struct AsyncMetricsGuard {
-    inner: Arc<LoomRuntimeInner>,
-}
-
-impl AsyncMetricsGuard {
-    fn new(inner: Arc<LoomRuntimeInner>) -> Self {
-        inner.prometheus_metrics.task_started();
-        Self { inner }
-    }
-}
-
-impl Drop for AsyncMetricsGuard {
-    fn drop(&mut self) {
-        self.inner.prometheus_metrics.task_completed();
-    }
-}
-
-/// Guard for tracking compute task state and metrics.
-///
-/// Panic-safe: executes even if the task closure panics.
-///
-/// SAFETY: The state lives in LoomRuntimeInner which outlives all rayon tasks
-/// because block_until_idle waits for compute_tasks to reach 0.
-struct ComputeTaskGuard {
-    state: *const ComputeTaskState,
-    metrics: *const LoomMetrics,
-}
-
-unsafe impl Send for ComputeTaskGuard {}
-
-impl ComputeTaskGuard {
-    /// Create a new guard, tracking submission in MAB metrics.
-    ///
-    /// This should be called BEFORE spawning on rayon.
-    fn new(state: &ComputeTaskState, metrics: &LoomMetrics) -> Self {
-        state.count.fetch_add(1, Ordering::Relaxed);
-        metrics.rayon_submitted();
-        Self {
-            state: state as *const ComputeTaskState,
-            metrics: metrics as *const LoomMetrics,
-        }
-    }
-
-    /// Mark that the rayon task has started executing.
-    ///
-    /// This should be called at the START of the rayon closure.
-    fn started(&self) {
-        // SAFETY: metrics outlives rayon tasks
-        unsafe {
-            (*self.metrics).rayon_started();
-        }
-    }
-}
-
-impl Drop for ComputeTaskGuard {
-    fn drop(&mut self) {
-        // SAFETY: state and metrics outlive rayon tasks due to shutdown waiting
-        unsafe {
-            // Track MAB metrics completion (panic-safe)
-            (*self.metrics).rayon_completed();
-
-            let prev = (*self.state).count.fetch_sub(1, Ordering::Release);
-            if prev == 1 {
-                // Count just went from 1 to 0, notify waiters
-                (*self.state).notify.notify_waiters();
-            }
-        }
-    }
-}
 
 /// A bespoke thread pool runtime combining tokio and rayon with CPU pinning.
 ///
@@ -191,6 +100,7 @@ impl Drop for ComputeTaskGuard {
 /// // Graceful shutdown from main thread
 /// runtime.block_until_idle();
 /// ```
+#[derive(Clone)]
 pub struct LoomRuntime {
     pub(crate) inner: Arc<LoomRuntimeInner>,
 }
@@ -207,7 +117,7 @@ pub(crate) struct LoomRuntimeInner {
     /// Track in-flight rayon tasks for graceful shutdown
     compute_state: ComputeTaskState,
     /// Per-type object pools for zero-allocation spawn_compute
-    pub(crate) pools: ComputePoolRegistry,
+    pub(crate) pools: TaskStatePool,
     /// Number of tokio worker threads
     pub(crate) tokio_threads: usize,
     /// Number of rayon worker threads
@@ -216,6 +126,9 @@ pub(crate) struct LoomRuntimeInner {
     pub(crate) tokio_cpus: Vec<usize>,
     /// CPUs allocated to rayon workers
     pub(crate) rayon_cpus: Vec<usize>,
+    /// The effective CPU set after applying all constraints
+    /// (process affinity, CUDA device locality)
+    pub(crate) effective_cpuset: Vec<usize>,
     /// Lazily initialized shared MAB scheduler
     mab_scheduler: OnceLock<Arc<MabScheduler>>,
     /// MAB knobs configuration
@@ -247,44 +160,74 @@ impl LoomRuntime {
     /// This is typically called via `LoomBuilder::build()`.
     pub(crate) fn from_config(config: LoomConfig) -> Result<Self> {
         let pool_size = config.compute_pool_size;
-        // Determine available CPUs
-        // Priority: CUDA device cpuset > user cpuset > all available CPUs
-        // Error if both cuda_device and cpuset are specified (mutually exclusive)
-        let cpus = {
+
+        // Determine available CPUs based on process affinity and CUDA device
+        //
+        // When pin_threads=true:
+        //   1. Get process affinity mask (respects cgroups/containers)
+        //   2. If CUDA device specified, intersect with CUDA's NUMA cpuset
+        //   3. Error if intersection is empty
+        //
+        // When pin_threads=false:
+        //   Use all available CPUs (no pinning will occur anyway)
+        let cpus = if config.pin_threads {
+            // Get process affinity mask (or fall back to available_cpus)
+            let process_mask = get_process_affinity_mask().unwrap_or_else(|| {
+                debug!("process affinity not available, using all CPUs");
+                available_cpus()
+            });
+            debug!(
+                process_mask = %format_cpuset(&process_mask),
+                "obtained process affinity mask"
+            );
+
             #[cfg(feature = "cuda")]
             {
-                // Check for conflicting configuration first
-                if config.cuda_device.is_some() && config.cpuset.is_some() {
-                    return Err(LoomError::CudaCpusetConflict);
-                }
-
                 if let Some(ref selector) = config.cuda_device {
                     match crate::cuda::cpuset_for_cuda_device(selector)? {
-                        Some(cuda_cpus) => cuda_cpus,
+                        Some(cuda_cpus) => {
+                            debug!(
+                                cuda_cpuset = %format_cpuset(&cuda_cpus),
+                                "obtained CUDA device cpuset"
+                            );
+                            let intersection = intersect_cpusets(&process_mask, &cuda_cpus);
+                            debug!(
+                                intersection = %format_cpuset(&intersection),
+                                "intersected process mask with CUDA cpuset"
+                            );
+                            if intersection.is_empty() {
+                                return Err(LoomError::CudaCpusetNoOverlap {
+                                    cuda_cpuset: format_cpuset(&cuda_cpus),
+                                    process_mask: format_cpuset(&process_mask),
+                                });
+                            }
+                            intersection
+                        }
                         None => {
-                            // Could not determine CUDA locality, fall back to all CPUs
-                            available_cpus()
+                            // Could not determine CUDA locality, use process mask
+                            debug!("CUDA locality not available, using process affinity mask");
+                            process_mask
                         }
                     }
-                } else if let Some(ref cpuset_str) = config.cpuset {
-                    parse_and_validate_cpuset(cpuset_str)?
                 } else {
-                    available_cpus()
+                    process_mask
                 }
             }
             #[cfg(not(feature = "cuda"))]
             {
-                if let Some(ref cpuset_str) = config.cpuset {
-                    parse_and_validate_cpuset(cpuset_str)?
-                } else {
-                    available_cpus()
-                }
+                process_mask
             }
+        } else {
+            // pin_threads=false: no pinning, just use all available CPUs
+            available_cpus()
         };
 
         if cpus.is_empty() {
             return Err(LoomError::NoCpusAvailable);
         }
+
+        // Store the effective cpuset before splitting
+        let effective_cpuset = cpus.clone();
 
         let total_cpus = cpus.len();
         let tokio_threads = config.effective_tokio_threads();
@@ -309,12 +252,15 @@ impl LoomRuntime {
             rayon_cpus.to_vec()
         };
 
+        let pin_threads = config.pin_threads;
+
         info!(
             prefix = %config.prefix,
             tokio_threads,
             rayon_threads,
-            total_cpus,
+            effective_cpuset = %format_cpuset(&effective_cpuset),
             pool_size,
+            pin_threads,
             "building loom runtime"
         );
 
@@ -332,13 +278,19 @@ impl LoomRuntime {
                 tokio_threads,
                 tokio_cpus.clone(),
                 weak_clone.clone(),
+                pin_threads,
             )
             .expect("failed to build tokio runtime");
 
             // Build rayon pool with thread-local injection
-            let rayon_pool =
-                Self::build_rayon_pool(&prefix, rayon_threads, rayon_cpus.clone(), weak_clone)
-                    .expect("failed to build rayon pool");
+            let rayon_pool = Self::build_rayon_pool(
+                &prefix,
+                rayon_threads,
+                rayon_cpus.clone(),
+                weak_clone,
+                pin_threads,
+            )
+            .expect("failed to build rayon pool");
 
             // Extract MAB knobs, using defaults if not configured
             let mab_knobs = config.mab_knobs.clone().unwrap_or_default();
@@ -359,11 +311,12 @@ impl LoomRuntime {
                 rayon_pool,
                 task_tracker: TaskTracker::new(),
                 compute_state: ComputeTaskState::new(),
-                pools: ComputePoolRegistry::new(pool_size),
+                pools: TaskStatePool::new(pool_size),
                 tokio_threads,
                 rayon_threads,
                 tokio_cpus,
                 rayon_cpus,
+                effective_cpuset,
                 mab_scheduler: OnceLock::new(),
                 mab_knobs,
                 prometheus_metrics,
@@ -378,6 +331,7 @@ impl LoomRuntime {
         num_threads: usize,
         cpus: Vec<usize>,
         runtime_weak: Weak<LoomRuntimeInner>,
+        pin_threads: bool,
     ) -> Result<tokio::runtime::Runtime> {
         let allocator = Arc::new(CpuAllocator::new(cpus));
         let prefix_clone = Arc::clone(prefix);
@@ -397,12 +351,14 @@ impl LoomRuntime {
                 format!("{}-tokio-{:04}", name_prefix, id)
             })
             .on_thread_start(move || {
-                // Pin CPU
-                let cpu_id = start_allocator.allocate();
-                if let Err(e) = pin_to_cpu(cpu_id) {
-                    warn!(%e, %start_prefix, cpu_id, "failed to pin tokio thread");
-                } else {
-                    debug!(cpu_id, %start_prefix, "pinned tokio thread to CPU");
+                // Pin CPU (if enabled)
+                if pin_threads {
+                    let cpu_id = start_allocator.allocate();
+                    if let Err(e) = pin_to_cpu(cpu_id) {
+                        warn!(%e, %start_prefix, cpu_id, "failed to pin tokio thread");
+                    } else {
+                        debug!(cpu_id, %start_prefix, "pinned tokio thread to CPU");
+                    }
                 }
 
                 // Inject runtime reference into thread-local
@@ -422,6 +378,7 @@ impl LoomRuntime {
         num_threads: usize,
         cpus: Vec<usize>,
         runtime_weak: Weak<LoomRuntimeInner>,
+        pin_threads: bool,
     ) -> Result<rayon::ThreadPool> {
         let allocator = Arc::new(CpuAllocator::new(cpus));
         let name_prefix = Arc::clone(prefix);
@@ -434,11 +391,13 @@ impl LoomRuntime {
             .num_threads(num_threads)
             .thread_name(move |i| format!("{}-rayon-{:04}", name_prefix, i))
             .start_handler(move |thread_index| {
-                // Pin CPU
-                let cpu_id = start_allocator.allocate();
-                debug!(thread_index, cpu_id, %start_prefix, "rayon thread starting");
-                if let Err(e) = pin_to_cpu(cpu_id) {
-                    warn!(%e, %start_prefix, cpu_id, thread_index, "failed to pin rayon thread");
+                // Pin CPU (if enabled)
+                if pin_threads {
+                    let cpu_id = start_allocator.allocate();
+                    debug!(thread_index, cpu_id, %start_prefix, "rayon thread starting");
+                    if let Err(e) = pin_to_cpu(cpu_id) {
+                        warn!(%e, %start_prefix, cpu_id, thread_index, "failed to pin rayon thread");
+                    }
                 }
 
                 // Inject runtime reference into thread-local
@@ -467,6 +426,11 @@ impl LoomRuntime {
     /// Zero overhead - returns a reference.
     pub fn tokio_handle(&self) -> &tokio::runtime::Handle {
         self.inner.tokio_runtime.handle()
+    }
+
+    /// Get the tokio runtime.
+    pub fn tokio_runtime(&self) -> &tokio::runtime::Runtime {
+        &self.inner.tokio_runtime
     }
 
     /// Get the rayon thread pool.
@@ -1067,6 +1031,24 @@ impl LoomRuntime {
     pub fn rayon_cpus(&self) -> &[usize] {
         &self.inner.rayon_cpus
     }
+
+    /// Get the effective CPU set after applying all constraints.
+    ///
+    /// This reflects the CPUs available after considering:
+    /// - Process affinity mask (cgroups/containers via `sched_getaffinity`)
+    /// - CUDA device NUMA locality (if `cuda_device` is configured)
+    ///
+    /// Returns the sorted list of CPU IDs that the runtime is using.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let runtime = LoomBuilder::new().build()?;
+    /// println!("Using CPUs: {:?}", runtime.effective_cpuset());
+    /// ```
+    pub fn effective_cpuset(&self) -> &[usize] {
+        &self.inner.effective_cpuset
+    }
 }
 
 impl LoomRuntimeInner {
@@ -1074,7 +1056,7 @@ impl LoomRuntimeInner {
     ///
     /// Uses per-type object pools for zero allocation after warmup.
     #[inline]
-    pub async fn spawn_compute<F, R>(self: &Arc<Self>, f: F) -> R
+    pub(crate) async fn spawn_compute<F, R>(self: &Arc<Self>, f: F) -> R
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -1123,7 +1105,7 @@ impl LoomRuntimeInner {
     /// 4. Therefore, `'env` references outlive all accesses to borrowed data
     ///
     /// This is the same safety argument used by `std::thread::scope`.
-    pub async fn scope_compute<'env, F, R>(self: &Arc<Self>, f: F) -> R
+    pub(crate) async fn scope_compute<'env, F, R>(self: &Arc<Self>, f: F) -> R
     where
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
@@ -1205,6 +1187,99 @@ impl std::fmt::Display for LoomRuntime {
     }
 }
 
+/// State for tracking in-flight compute tasks.
+///
+/// Combines the task counter with a notification mechanism for efficient
+/// shutdown waiting (avoids spin loops).
+struct ComputeTaskState {
+    /// Number of tasks currently executing on rayon
+    count: AtomicUsize,
+    /// Notified when count reaches 0
+    notify: Notify,
+}
+
+impl ComputeTaskState {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+}
+
+/// Guard for tracking async task metrics.
+///
+/// Panic-safe: task_completed is called even if the future panics.
+struct AsyncMetricsGuard {
+    inner: Arc<LoomRuntimeInner>,
+}
+
+impl AsyncMetricsGuard {
+    fn new(inner: Arc<LoomRuntimeInner>) -> Self {
+        inner.prometheus_metrics.task_started();
+        Self { inner }
+    }
+}
+
+impl Drop for AsyncMetricsGuard {
+    fn drop(&mut self) {
+        self.inner.prometheus_metrics.task_completed();
+    }
+}
+
+/// Guard for tracking compute task state and metrics.
+///
+/// Panic-safe: executes even if the task closure panics.
+///
+/// SAFETY: The state lives in LoomRuntimeInner which outlives all rayon tasks
+/// because block_until_idle waits for compute_tasks to reach 0.
+struct ComputeTaskGuard {
+    state: *const ComputeTaskState,
+    metrics: *const LoomMetrics,
+}
+
+unsafe impl Send for ComputeTaskGuard {}
+
+impl ComputeTaskGuard {
+    /// Create a new guard, tracking submission in MAB metrics.
+    ///
+    /// This should be called BEFORE spawning on rayon.
+    fn new(state: &ComputeTaskState, metrics: &LoomMetrics) -> Self {
+        state.count.fetch_add(1, Ordering::Relaxed);
+        metrics.rayon_submitted();
+        Self {
+            state: state as *const ComputeTaskState,
+            metrics: metrics as *const LoomMetrics,
+        }
+    }
+
+    /// Mark that the rayon task has started executing.
+    ///
+    /// This should be called at the START of the rayon closure.
+    fn started(&self) {
+        // SAFETY: metrics outlives rayon tasks
+        unsafe {
+            (*self.metrics).rayon_started();
+        }
+    }
+}
+
+impl Drop for ComputeTaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: state and metrics outlive rayon tasks due to shutdown waiting
+        unsafe {
+            // Track MAB metrics completion (panic-safe)
+            (*self.metrics).rayon_completed();
+
+            let prev = (*self.state).count.fetch_sub(1, Ordering::Release);
+            if prev == 1 {
+                // Count just went from 1 to 0, notify waiters
+                (*self.state).notify.notify_waiters();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,10 +1288,10 @@ mod tests {
     fn test_config() -> LoomConfig {
         LoomConfig {
             prefix: "test".to_string(),
-            cpuset: None,
             tokio_threads: Some(1),
             rayon_threads: Some(1),
             compute_pool_size: DEFAULT_POOL_SIZE,
+            pin_threads: false, // Disable pinning in tests for portability
             #[cfg(feature = "cuda")]
             cuda_device: None,
             mab_knobs: None,
@@ -1304,10 +1379,11 @@ mod tests {
 
     #[test]
     fn test_insufficient_cpus_error() {
+        // Request more threads than available CPUs
+        let available = crate::cpuset::available_cpus().len();
         let mut config = test_config();
-        config.cpuset = Some("0".to_string()); // Only 1 CPU
-        config.tokio_threads = Some(2);
-        config.rayon_threads = Some(2);
+        config.tokio_threads = Some(available + 1);
+        config.rayon_threads = Some(available + 1);
 
         let result = LoomRuntime::from_config(config);
         assert!(matches!(result, Err(LoomError::InsufficientCpus { .. })));
@@ -1413,41 +1489,29 @@ mod tests {
     }
 
     #[test]
-    fn test_cpuset_only() {
-        let mut config = test_config();
-        config.cpuset = Some("0".to_string());
-        config.tokio_threads = Some(1);
-        config.rayon_threads = Some(0);
-
+    fn test_effective_cpuset_getter() {
+        let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
-        // Should use the user-provided cpuset
-        assert_eq!(runtime.inner.tokio_cpus, vec![0]);
-    }
-
-    /// Test that CUDA cpuset conflict error is properly detected.
-    /// This test requires actual CUDA hardware to verify the conflict.
-    #[cfg(feature = "cuda-tests")]
-    #[test]
-    fn test_cuda_cpuset_conflict_error() {
-        let mut config = test_config();
-        config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
-        config.cpuset = Some("0".to_string()); // Conflict: both specified
-
-        let result = LoomRuntime::from_config(config);
-        assert!(
-            matches!(result, Err(LoomError::CudaCpusetConflict)),
-            "expected CudaCpusetConflict error, got {:?}",
-            result
+        // effective_cpuset should return a non-empty slice
+        let cpuset = runtime.effective_cpuset();
+        assert!(!cpuset.is_empty(), "effective_cpuset should not be empty");
+        // Should be sorted
+        let mut sorted = cpuset.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            cpuset,
+            sorted.as_slice(),
+            "effective_cpuset should be sorted"
         );
     }
 
-    /// Test that CUDA device alone (without cpuset) works.
+    /// Test that CUDA device works and uses process affinity intersection.
     #[cfg(feature = "cuda-tests")]
     #[test]
-    fn test_cuda_device_only() {
+    fn test_cuda_device_with_affinity() {
         let mut config = test_config();
         config.cuda_device = Some(crate::cuda::CudaDeviceSelector::DeviceId(0));
-        config.cpuset = None;
+        config.pin_threads = true;
 
         let runtime = LoomRuntime::from_config(config).unwrap();
         // Should have found CUDA-local CPUs
@@ -1728,42 +1792,47 @@ mod tests {
     /// This validates the future correctly returns Poll::Pending and wakes up when done.
     #[test]
     fn test_scope_compute_yields_to_executor() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
         use std::sync::Arc;
         use std::time::Duration;
+        use tokio::sync::Notify;
 
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
-            let concurrent_task_ran = Arc::new(AtomicBool::new(false));
-            let concurrent_task_ran_clone = concurrent_task_ran.clone();
+            // Notify for scope_compute -> async task (sync notify, async wait)
+            let scope_started = Arc::new(Notify::new());
+            let scope_started_clone = scope_started.clone();
 
-            // Spawn a concurrent async task that should run while scope_compute is waiting
+            // Channel for async task -> scope_compute (non-blocking send, blocking recv)
+            let (async_responded_tx, async_responded_rx) = mpsc::channel();
+
+            // Spawn async task that waits for scope_compute to start, then responds
             let concurrent_handle = runtime.spawn_async(async move {
-                // Wait a bit for the scope_compute to start
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                concurrent_task_ran_clone.store(true, Ordering::Release);
+                // Wait for scope_compute to signal it started (async wait - doesn't block tokio)
+                scope_started_clone.notified().await;
+                // Signal back that we received it (non-blocking send)
+                async_responded_tx.send(()).unwrap();
                 100
             });
 
-            // Run scope_compute with work that takes some time
+            // Run scope_compute with round-trip handshake
+            // Move receiver into the closure (FnOnce) so it's owned, not borrowed
             let result = runtime
-                .scope_compute(|_s| {
-                    // Simulate some work
-                    std::thread::sleep(Duration::from_millis(20));
+                .scope_compute(move |_s| {
+                    // Signal that we've started (wakes the async task)
+                    scope_started.notify_one();
+                    // Wait for async task to respond (blocking recv on rayon thread is fine)
+                    // If tokio didn't yield, async task can't respond, and this times out
+                    async_responded_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("Async task should respond - executor may not be yielding");
                     42
                 })
                 .await;
 
             assert_eq!(result, 42);
-
-            // Verify the concurrent task actually ran during scope_compute
-            // (check BEFORE awaiting the handle to prove it ran concurrently)
-            assert!(
-                concurrent_task_ran.load(Ordering::Acquire),
-                "Concurrent task should have run while scope_compute was in progress"
-            );
 
             // The concurrent task should have completed
             let concurrent_result = concurrent_handle.await.unwrap();

@@ -19,10 +19,6 @@ pub struct LoomConfig {
     #[serde(default = "default_prefix")]
     pub prefix: String,
 
-    /// CPU set string (e.g., "0-7,16-23") or None for all CPUs
-    #[serde(default)]
-    pub cpuset: Option<String>,
-
     /// Number of tokio worker threads (default: 1)
     #[serde(default)]
     pub tokio_threads: Option<usize>,
@@ -34,6 +30,10 @@ pub struct LoomConfig {
     /// Size of compute task pool per result type (default: 64)
     #[serde(default = "default_compute_pool_size")]
     pub compute_pool_size: usize,
+
+    /// Whether to pin threads to specific CPUs (default: true)
+    #[serde(default = "default_pin_threads")]
+    pub pin_threads: bool,
 
     /// CUDA device selection (feature-gated)
     #[cfg(feature = "cuda")]
@@ -65,14 +65,18 @@ fn default_prefix() -> String {
     "loom".to_string()
 }
 
+fn default_pin_threads() -> bool {
+    true
+}
+
 impl Default for LoomConfig {
     fn default() -> Self {
         Self {
             prefix: default_prefix(),
-            cpuset: None,
             tokio_threads: None,
             rayon_threads: None,
             compute_pool_size: default_compute_pool_size(),
+            pin_threads: default_pin_threads(),
             #[cfg(feature = "cuda")]
             cuda_device: None,
             mab_knobs: None,
@@ -113,10 +117,10 @@ mod tests {
     fn test_default_config() {
         let config = LoomConfig::default();
         assert_eq!(config.prefix, "loom");
-        assert!(config.cpuset.is_none());
         assert!(config.tokio_threads.is_none());
         assert!(config.rayon_threads.is_none());
         assert_eq!(config.compute_pool_size, 64);
+        assert!(config.pin_threads);
         assert!(config.mab_knobs.is_none());
         assert!(config.calibration.is_none());
     }
@@ -149,7 +153,6 @@ mod tests {
     fn test_deserialize_config() {
         let toml = r#"
             prefix = "myapp"
-            cpuset = "0-3"
             tokio_threads = 2
             rayon_threads = 6
             compute_pool_size = 128
@@ -157,9 +160,41 @@ mod tests {
 
         let config: LoomConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.prefix, "myapp");
-        assert_eq!(config.cpuset, Some("0-3".to_string()));
         assert_eq!(config.tokio_threads, Some(2));
         assert_eq!(config.rayon_threads, Some(6));
         assert_eq!(config.compute_pool_size, 128);
+        // pin_threads should default to true when not specified
+        assert!(config.pin_threads);
+    }
+
+    #[test]
+    fn test_pin_threads_default() {
+        let config = LoomConfig::default();
+        assert!(config.pin_threads, "pin_threads should default to true");
+    }
+
+    #[test]
+    fn test_pin_threads_deserialize() {
+        let toml = r#"
+            prefix = "test"
+            pin_threads = false
+        "#;
+
+        let config: LoomConfig = toml::from_str(toml).unwrap();
+        assert!(!config.pin_threads, "pin_threads should be false when set");
+    }
+
+    #[test]
+    fn test_pin_threads_serialize() {
+        let config = LoomConfig {
+            pin_threads: false,
+            ..Default::default()
+        };
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            serialized.contains("pin_threads = false"),
+            "serialized config should contain pin_threads = false"
+        );
     }
 }

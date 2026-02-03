@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 /// // Pin current thread to CPU 0
 /// pin_to_cpu(0).expect("failed to pin thread");
 /// ```
-pub fn pin_to_cpu(cpu_id: usize) -> Result<()> {
+pub(crate) fn pin_to_cpu(cpu_id: usize) -> Result<()> {
     let core_id = CoreId { id: cpu_id };
     if core_affinity::set_for_current(core_id) {
         debug!(cpu_id, "pinned thread to CPU");
@@ -41,7 +41,7 @@ pub fn pin_to_cpu(cpu_id: usize) -> Result<()> {
 /// This is used internally by the runtime to assign CPUs to tokio and rayon
 /// worker threads.
 #[derive(Debug)]
-pub struct CpuAllocator {
+pub(crate) struct CpuAllocator {
     cpus: Vec<usize>,
     next: AtomicUsize,
 }
@@ -52,7 +52,7 @@ impl CpuAllocator {
     /// # Panics
     ///
     /// Panics if `cpus` is empty.
-    pub fn new(cpus: Vec<usize>) -> Self {
+    pub(crate) fn new(cpus: Vec<usize>) -> Self {
         assert!(!cpus.is_empty(), "CPU allocator requires at least one CPU");
         Self {
             cpus,
@@ -64,23 +64,23 @@ impl CpuAllocator {
     ///
     /// This method is thread-safe and can be called from multiple threads
     /// simultaneously.
-    pub fn allocate(&self) -> usize {
+    pub(crate) fn allocate(&self) -> usize {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.cpus.len();
         self.cpus[index]
     }
 
     /// Get the total number of CPUs in the allocator.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.cpus.len()
     }
 
     /// Check if the allocator is empty.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.cpus.is_empty()
     }
 
     /// Get a reference to the underlying CPU list.
-    pub fn cpus(&self) -> &[usize] {
+    pub(crate) fn cpus(&self) -> &[usize] {
         &self.cpus
     }
 }
@@ -94,7 +94,7 @@ impl CpuAllocator {
 ///
 /// * `allocator` - Arc-wrapped CPU allocator to distribute CPUs
 /// * `prefix` - Thread name prefix for logging
-pub fn make_pin_handler(
+pub(crate) fn make_pin_handler(
     allocator: Arc<CpuAllocator>,
     prefix: Arc<str>,
 ) -> impl Fn() + Send + Sync + Clone + 'static {
@@ -114,7 +114,7 @@ pub fn make_pin_handler(
 ///
 /// * `allocator` - Arc-wrapped CPU allocator to distribute CPUs
 /// * `prefix` - Thread name prefix for logging
-pub fn make_rayon_pin_handler(
+pub(crate) fn make_rayon_pin_handler(
     allocator: Arc<CpuAllocator>,
     prefix: Arc<str>,
 ) -> impl Fn(usize) + Send + Sync + Clone + 'static {

@@ -1,4 +1,4 @@
-//! Compute task pool registry for zero-allocation spawning.
+//! Task state pool for zero-allocation spawning.
 //!
 //! This module provides a per-type object pool for `TaskState` objects used by
 //! `spawn_compute()`. After warmup, `spawn_compute()` can reuse pooled state
@@ -7,7 +7,7 @@
 //! # Architecture
 //!
 //! ```text
-//! ComputePoolRegistry
+//! TaskStatePool
 //!   └── HashMap<TypeId, Box<dyn PoolWrapper>>
 //!         └── PoolWrapperImpl<R>
 //!               └── Arc<TypedPool<R>>
@@ -27,13 +27,13 @@ use parking_lot::RwLock;
 use crate::bridge::TaskState;
 
 /// Default pool size per result type.
-pub const DEFAULT_POOL_SIZE: usize = 64;
+pub(crate) const DEFAULT_POOL_SIZE: usize = 64;
 
-/// Registry of per-type compute pools.
+/// Pool of per-type `TaskState` objects for zero-allocation spawning.
 ///
-/// Thread-safe registry that manages one pool per result type. Pools are created
-/// lazily on first use and shared across all threads.
-pub(crate) struct ComputePoolRegistry {
+/// Thread-safe pool that manages one sub-pool per result type. Sub-pools are
+/// created lazily on first use and shared across all threads.
+pub(crate) struct TaskStatePool {
     pools: RwLock<HashMap<TypeId, Box<dyn PoolWrapper>>>,
     default_size: usize,
 }
@@ -77,33 +77,33 @@ impl<R: Send + 'static> TypedPool<R> {
     }
 
     /// Try to get a reusable TaskState from the pool.
-    pub fn pop(&self) -> Option<Arc<TaskState<R>>> {
+    pub(crate) fn pop(&self) -> Option<Arc<TaskState<R>>> {
         self.queue.pop()
     }
 
     /// Return a TaskState to the pool for reuse.
     ///
     /// If the pool is full, the state is dropped.
-    pub fn push(&self, state: Arc<TaskState<R>>) {
+    pub(crate) fn push(&self, state: Arc<TaskState<R>>) {
         // Ignore error if pool is full - the state will just be dropped
         let _ = self.queue.push(state);
     }
 }
 
-impl ComputePoolRegistry {
-    /// Create a new registry with the given default pool size.
-    pub fn new(default_size: usize) -> Self {
+impl TaskStatePool {
+    /// Create a new pool with the given default sub-pool size.
+    pub(crate) fn new(default_size: usize) -> Self {
         Self {
             pools: RwLock::new(HashMap::new()),
             default_size,
         }
     }
 
-    /// Get or create a pool for type R.
+    /// Get or create a sub-pool for type R.
     ///
-    /// The first call for a given type creates the pool (slow path with write lock).
+    /// The first call for a given type creates the sub-pool (slow path with write lock).
     /// Subsequent calls use the fast path (read lock only).
-    pub fn get_or_create<R: Send + 'static>(&self) -> Arc<TypedPool<R>> {
+    pub(crate) fn get_or_create<R: Send + 'static>(&self) -> Arc<TypedPool<R>> {
         let type_id = TypeId::of::<R>();
 
         // Fast path: read lock
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_registry_creates_per_type_pools() {
-        let registry = ComputePoolRegistry::new(4);
+        let registry = TaskStatePool::new(4);
 
         // Get pool for i32
         let pool_i32a = registry.get_or_create::<i32>();
@@ -211,7 +211,7 @@ mod tests {
     fn test_registry_concurrent_access() {
         use std::thread;
 
-        let registry = Arc::new(ComputePoolRegistry::new(64));
+        let registry = Arc::new(TaskStatePool::new(64));
         let mut handles = vec![];
 
         for _ in 0..4 {

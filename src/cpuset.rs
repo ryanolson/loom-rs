@@ -100,6 +100,101 @@ pub fn available_cpus() -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// Get the process CPU affinity mask.
+///
+/// On Linux, uses `sched_getaffinity(0)` to get the CPUs that the current
+/// process is allowed to run on. This respects cgroups, containers, and
+/// taskset restrictions.
+///
+/// On non-Linux platforms, returns `None` (caller should fall back to
+/// `available_cpus()`).
+///
+/// # Examples
+///
+/// ```
+/// use loom_rs::cpuset::get_process_affinity_mask;
+///
+/// if let Some(cpus) = get_process_affinity_mask() {
+///     println!("Process allowed on CPUs: {:?}", cpus);
+/// } else {
+///     println!("Process affinity not available on this platform");
+/// }
+/// ```
+#[cfg(target_os = "linux")]
+pub fn get_process_affinity_mask() -> Option<Vec<usize>> {
+    // cpu_set_t can hold up to 1024 CPUs by default
+    // SAFETY: cpu_set_t is a plain data type safe to zero-initialize
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+
+    // SAFETY: We're passing a valid pointer to a zeroed cpu_set_t
+    // and the correct size. sched_getaffinity with pid=0 gets current process.
+    unsafe {
+        let result = libc::sched_getaffinity(
+            0, // 0 = current process
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &mut cpuset,
+        );
+
+        if result != 0 {
+            return None;
+        }
+
+        // Collect all CPUs that are set in the mask
+        let mut cpus = Vec::new();
+        // Check up to 1024 CPUs (the default cpu_set_t size)
+        for cpu in 0..1024 {
+            if libc::CPU_ISSET(cpu, &cpuset) {
+                cpus.push(cpu);
+            }
+        }
+
+        if cpus.is_empty() {
+            None
+        } else {
+            Some(cpus)
+        }
+    }
+}
+
+/// Get the process CPU affinity mask.
+///
+/// On non-Linux platforms, returns `None` (caller should fall back to
+/// `available_cpus()`).
+#[cfg(not(target_os = "linux"))]
+pub fn get_process_affinity_mask() -> Option<Vec<usize>> {
+    None
+}
+
+/// Intersect two CPU sets.
+///
+/// Returns a sorted vector of CPU IDs that appear in both sets.
+/// Uses HashSet for O(n) performance.
+///
+/// # Examples
+///
+/// ```
+/// use loom_rs::cpuset::intersect_cpusets;
+///
+/// let a = vec![0, 1, 2, 3, 8, 9];
+/// let b = vec![2, 3, 4, 5, 8];
+/// let result = intersect_cpusets(&a, &b);
+/// assert_eq!(result, vec![2, 3, 8]);
+///
+/// // Empty intersection
+/// let result = intersect_cpusets(&[0, 1], &[2, 3]);
+/// assert!(result.is_empty());
+/// ```
+pub fn intersect_cpusets(a: &[usize], b: &[usize]) -> Vec<usize> {
+    use std::collections::HashSet;
+
+    let set_a: HashSet<_> = a.iter().copied().collect();
+    let set_b: HashSet<_> = b.iter().copied().collect();
+
+    let mut result: Vec<_> = set_a.intersection(&set_b).copied().collect();
+    result.sort_unstable();
+    result
+}
+
 /// Validate that all CPUs in the set are available on this system.
 ///
 /// # Errors
@@ -320,5 +415,104 @@ mod tests {
             let parsed = parse_cpuset(&formatted).unwrap();
             assert_eq!(parsed, cpus);
         }
+    }
+
+    #[test]
+    fn test_intersect_cpusets_overlap() {
+        let a = vec![0, 1, 2, 3, 8, 9];
+        let b = vec![2, 3, 4, 5, 8];
+        let result = intersect_cpusets(&a, &b);
+        assert_eq!(result, vec![2, 3, 8]);
+    }
+
+    #[test]
+    fn test_intersect_cpusets_no_overlap() {
+        let a = vec![0, 1, 2];
+        let b = vec![3, 4, 5];
+        let result = intersect_cpusets(&a, &b);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_intersect_cpusets_empty_input() {
+        let a = vec![0, 1, 2];
+        let result = intersect_cpusets(&a, &[]);
+        assert!(result.is_empty());
+
+        let result = intersect_cpusets(&[], &a);
+        assert!(result.is_empty());
+
+        let result = intersect_cpusets(&[], &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_intersect_cpusets_full_overlap() {
+        let a = vec![0, 1, 2, 3];
+        let b = vec![0, 1, 2, 3];
+        let result = intersect_cpusets(&a, &b);
+        assert_eq!(result, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_intersect_cpusets_unsorted_input() {
+        let a = vec![3, 1, 8, 2];
+        let b = vec![9, 2, 1, 5];
+        let result = intersect_cpusets(&a, &b);
+        // Result should be sorted regardless of input order
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_intersect_cpusets_with_duplicates() {
+        // Duplicates in input should be handled correctly
+        let a = vec![0, 1, 1, 2, 2, 2];
+        let b = vec![1, 2, 2, 3];
+        let result = intersect_cpusets(&a, &b);
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_get_process_affinity_mask_returns_some() {
+        // On Linux, this should always return Some
+        let mask = get_process_affinity_mask();
+        assert!(
+            mask.is_some(),
+            "get_process_affinity_mask should return Some on Linux"
+        );
+        let cpus = mask.unwrap();
+        assert!(
+            !cpus.is_empty(),
+            "process should be allowed on at least one CPU"
+        );
+        // Should include CPU 0 in most cases
+        assert!(cpus.contains(&0), "CPU 0 should typically be allowed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_get_process_affinity_mask_subset_of_available() {
+        let mask = get_process_affinity_mask().unwrap();
+        let available = available_cpus();
+        // Process affinity should be a subset of available CPUs
+        for cpu in &mask {
+            assert!(
+                available.contains(cpu),
+                "affinity mask CPU {} not in available CPUs",
+                cpu
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_get_process_affinity_mask_returns_none() {
+        // On non-Linux, this should return None
+        let mask = get_process_affinity_mask();
+        assert!(
+            mask.is_none(),
+            "get_process_affinity_mask should return None on non-Linux"
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "loom-rs"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Weaving threads together - A bespoke thread pool runtime combining tokio and rayon with CPU pinning capabilities"
 license = "MIT"
@@ -8,7 +8,11 @@ repository = "https://github.com/ryanolson/loom-rs"
 keywords = ["async", "runtime", "threadpool", "cpu-affinity", "tokio"]
 categories = ["asynchronous", "concurrency"]
 
+[workspace]
+members = ["loom-macros"]
+
 [dependencies]
+loom-macros = { path = "loom-macros", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 rayon = "1.10"
@@ -28,6 +32,7 @@ rand_distr = "0.4"
 prometheus = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 hwlocality = { version = "1.0.0-alpha.11", optional = true }
 nvml-wrapper = { version = "0.10", optional = true }
 

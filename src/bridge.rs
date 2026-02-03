@@ -27,21 +27,21 @@ use parking_lot::{Condvar, Mutex};
 /// A future representing work spawned on rayon.
 ///
 /// Uses atomic waker for minimal overhead (~32 bytes vs ~80 bytes for oneshot).
-pub struct RayonTask<R> {
+pub(crate) struct RayonTask<R> {
     state: Arc<TaskState<R>>,
 }
 
 /// Shared state between the task future and completion handle.
 ///
 /// This is public for use by the pool module.
-pub struct TaskState<R> {
+pub(crate) struct TaskState<R> {
     result: Mutex<Option<R>>,
     waker: DiatomicWaker,
 }
 
 impl<R> TaskState<R> {
     /// Create a new task state.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             result: Mutex::new(None),
             waker: DiatomicWaker::new(),
@@ -51,7 +51,7 @@ impl<R> TaskState<R> {
     /// Reset the state for reuse.
     ///
     /// This clears any pending result and prepares the state for a new task.
-    pub fn reset(&self) {
+    pub(crate) fn reset(&self) {
         *self.result.lock() = None;
         // DiatomicWaker doesn't need explicit reset - it will be overwritten on next register
     }
@@ -66,7 +66,7 @@ impl<R> Default for TaskState<R> {
 impl<R> RayonTask<R> {
     /// Create a new task and return (task, completion_handle).
     #[inline]
-    pub fn new() -> (Self, TaskCompletion<R>) {
+    pub(crate) fn new() -> (Self, TaskCompletion<R>) {
         let state = Arc::new(TaskState {
             result: Mutex::new(None),
             waker: DiatomicWaker::new(),
@@ -81,14 +81,14 @@ impl<R> RayonTask<R> {
 }
 
 /// Handle used by rayon thread to complete the task.
-pub struct TaskCompletion<R> {
+pub(crate) struct TaskCompletion<R> {
     state: Arc<TaskState<R>>,
 }
 
 impl<R> TaskCompletion<R> {
     /// Complete the task with a result. Wakes the waiting future.
     #[inline]
-    pub fn complete(self, result: R) {
+    pub(crate) fn complete(self, result: R) {
         *self.state.result.lock() = Some(result);
         self.state.waker.notify();
     }
@@ -99,12 +99,12 @@ impl<R> TaskCompletion<R> {
 /// Unlike `RayonTask`, this reuses a `TaskState` from a pool, achieving
 /// zero allocation after warmup. The caller is responsible for returning
 /// the state to the pool after the result is consumed.
-pub struct PooledRayonTask<R: Send + 'static> {
+pub(crate) struct PooledRayonTask<R: Send + 'static> {
     state: Arc<TaskState<R>>,
 }
 
 /// Handle used by rayon thread to complete a pooled task.
-pub struct PooledTaskCompletion<R: Send + 'static> {
+pub(crate) struct PooledTaskCompletion<R: Send + 'static> {
     state: Arc<TaskState<R>>,
 }
 
@@ -114,7 +114,9 @@ impl<R: Send + 'static> PooledRayonTask<R> {
     /// Returns (task, completion_handle, state_for_return).
     /// The caller should return `state_for_return` to the pool after awaiting the task.
     #[inline]
-    pub fn new(state: Arc<TaskState<R>>) -> (Self, PooledTaskCompletion<R>, Arc<TaskState<R>>) {
+    pub(crate) fn new(
+        state: Arc<TaskState<R>>,
+    ) -> (Self, PooledTaskCompletion<R>, Arc<TaskState<R>>) {
         let state_for_return = state.clone();
         (
             PooledRayonTask {
@@ -129,7 +131,7 @@ impl<R: Send + 'static> PooledRayonTask<R> {
 impl<R: Send + 'static> PooledTaskCompletion<R> {
     /// Complete the task with a result. Wakes the waiting future.
     #[inline]
-    pub fn complete(self, result: R) {
+    pub(crate) fn complete(self, result: R) {
         *self.state.result.lock() = Some(result);
         self.state.waker.notify();
     }
@@ -202,7 +204,7 @@ impl<R> Future for RayonTask<R> {
 ///
 /// The result stores `Result<R, Box<dyn Any + Send>>` to handle panics - if the
 /// closure panics, we capture the payload and re-raise it when the future is polled.
-pub struct ScopedTaskState<R> {
+pub(crate) struct ScopedTaskState<R> {
     /// Stores Ok(result) on success, Err(panic_payload) on panic
     result: Mutex<Option<Result<R, Box<dyn Any + Send>>>>,
     waker: DiatomicWaker,
@@ -215,7 +217,7 @@ pub struct ScopedTaskState<R> {
 
 impl<R> ScopedTaskState<R> {
     /// Create a new scoped task state.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             result: Mutex::new(None),
             waker: DiatomicWaker::new(),
@@ -242,13 +244,13 @@ impl<R> Default for ScopedTaskState<R> {
 ///
 /// In normal usage (awaiting to completion), Drop is a no-op since the scope
 /// has already completed.
-pub struct ScopedComputeFuture<R> {
+pub(crate) struct ScopedComputeFuture<R> {
     state: Arc<ScopedTaskState<R>>,
 }
 
 impl<R> ScopedComputeFuture<R> {
     /// Create a new scoped compute future.
-    pub fn new(state: Arc<ScopedTaskState<R>>) -> Self {
+    pub(crate) fn new(state: Arc<ScopedTaskState<R>>) -> Self {
         Self { state }
     }
 }
@@ -303,19 +305,19 @@ impl<R> Drop for ScopedComputeFuture<R> {
 }
 
 /// Handle used by rayon thread to complete a scoped task.
-pub struct ScopedCompletion<R> {
+pub(crate) struct ScopedCompletion<R> {
     state: Arc<ScopedTaskState<R>>,
 }
 
 impl<R> ScopedCompletion<R> {
     /// Create a new scoped completion handle.
-    pub fn new(state: Arc<ScopedTaskState<R>>) -> Self {
+    pub(crate) fn new(state: Arc<ScopedTaskState<R>>) -> Self {
         Self { state }
     }
 
     /// Complete the task with a result. Wakes the waiting future.
     #[inline]
-    pub fn complete(self, result: R) {
+    pub(crate) fn complete(self, result: R) {
         self.complete_with_result(Ok(result));
     }
 
@@ -323,7 +325,7 @@ impl<R> ScopedCompletion<R> {
     ///
     /// The panic will be resumed when the future is polled.
     #[inline]
-    pub fn complete_with_panic(self, payload: Box<dyn Any + Send>) {
+    pub(crate) fn complete_with_panic(self, payload: Box<dyn Any + Send>) {
         self.complete_with_result(Err(payload));
     }
 
