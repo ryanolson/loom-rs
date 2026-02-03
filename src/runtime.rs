@@ -726,6 +726,21 @@ impl LoomRuntime {
     /// to prevent use-after-free of borrowed data. In normal usage (awaiting to
     /// completion), there is no blocking overhead.
     ///
+    /// # Panic Safety
+    ///
+    /// If the closure or any spawned work panics, the panic is captured and
+    /// re-raised when the future is polled. This ensures panics propagate to
+    /// the async context as expected.
+    ///
+    /// # Leaking the Future
+    ///
+    /// **Important:** Do not leak this future via `std::mem::forget` or similar.
+    /// The safety of borrowed data relies on the future's `Drop` implementation
+    /// blocking until the rayon scope completes. Leaking the future would allow
+    /// the rayon work to continue accessing borrowed data after it goes out of
+    /// scope, leading to undefined behavior. This is a known limitation shared
+    /// by other scoped async APIs (e.g., `async-scoped`).
+    ///
     /// # Examples
     ///
     /// ```ignore
@@ -1130,14 +1145,18 @@ impl LoomRuntimeInner {
         // Create guard BEFORE spawning - it increments counter and tracks MAB metrics
         let guard = ComputeTaskGuard::new(&self.compute_state, &self.prometheus_metrics);
 
-        // Create a closure that captures f, completion, and guard
+        // Create a closure that captures f, completion, and guard.
+        // We use catch_unwind to ensure completion is always signaled, even on panic.
         let work = move || {
             guard.started();
             let result = {
                 let _guard = guard;
-                rayon::scope(|s| f(s))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rayon::scope(|s| f(s))))
             };
-            completion.complete(result);
+            match result {
+                Ok(value) => completion.complete(value),
+                Err(payload) => completion.complete_with_panic(payload),
+            }
         };
 
         // SAFETY: We erase the lifetime to 'static here. This is safe because:
@@ -1720,9 +1739,6 @@ mod tests {
             let concurrent_task_ran = Arc::new(AtomicBool::new(false));
             let concurrent_task_ran_clone = concurrent_task_ran.clone();
 
-            let scope_started = Arc::new(AtomicBool::new(false));
-            let scope_started_clone = scope_started.clone();
-
             // Spawn a concurrent async task that should run while scope_compute is waiting
             let concurrent_handle = runtime.spawn_async(async move {
                 // Wait a bit for the scope_compute to start
@@ -1734,7 +1750,6 @@ mod tests {
             // Run scope_compute with work that takes some time
             let result = runtime
                 .scope_compute(|_s| {
-                    scope_started_clone.store(true, Ordering::Release);
                     // Simulate some work
                     std::thread::sleep(Duration::from_millis(20));
                     42
@@ -1743,15 +1758,16 @@ mod tests {
 
             assert_eq!(result, 42);
 
-            // The concurrent task should have completed
-            let concurrent_result = concurrent_handle.await.unwrap();
-            assert_eq!(concurrent_result, 100);
-
             // Verify the concurrent task actually ran during scope_compute
+            // (check BEFORE awaiting the handle to prove it ran concurrently)
             assert!(
                 concurrent_task_ran.load(Ordering::Acquire),
                 "Concurrent task should have run while scope_compute was in progress"
             );
+
+            // The concurrent task should have completed
+            let concurrent_result = concurrent_handle.await.unwrap();
+            assert_eq!(concurrent_result, 100);
         });
     }
 
@@ -1833,6 +1849,41 @@ mod tests {
                 scope_completed.load(Ordering::Acquire),
                 "Scope should have completed even though future was cancelled"
             );
+        });
+    }
+
+    /// Test that panics inside scope_compute are properly propagated to the awaiter.
+    #[test]
+    #[should_panic(expected = "intentional panic for testing")]
+    fn test_scope_compute_panic_propagation() {
+        let config = test_config();
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        runtime.block_on(async {
+            runtime
+                .scope_compute(|_s| {
+                    panic!("intentional panic for testing");
+                })
+                .await
+        });
+    }
+
+    /// Test that panics in spawned work inside scope_compute are properly propagated.
+    #[test]
+    #[should_panic(expected = "panic in spawned work")]
+    fn test_scope_compute_spawned_panic_propagation() {
+        let mut config = test_config();
+        config.rayon_threads = Some(2);
+        let runtime = LoomRuntime::from_config(config).unwrap();
+
+        runtime.block_on(async {
+            runtime
+                .scope_compute(|s| {
+                    s.spawn(|_| {
+                        panic!("panic in spawned work");
+                    });
+                })
+                .await
         });
     }
 

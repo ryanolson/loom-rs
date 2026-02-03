@@ -13,7 +13,9 @@
 
 #![allow(dead_code)]
 
+use std::any::Any;
 use std::future::Future;
+use std::panic;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -197,10 +199,14 @@ impl<R> Future for RayonTask<R> {
 /// The completion signaling uses a condvar for cancellation safety - if the
 /// future is dropped before completion (e.g., via `select!`), we must block
 /// until the scope finishes to avoid dangling references.
+///
+/// The result stores `Result<R, Box<dyn Any + Send>>` to handle panics - if the
+/// closure panics, we capture the payload and re-raise it when the future is polled.
 pub struct ScopedTaskState<R> {
-    result: Mutex<Option<R>>,
+    /// Stores Ok(result) on success, Err(panic_payload) on panic
+    result: Mutex<Option<Result<R, Box<dyn Any + Send>>>>,
     waker: DiatomicWaker,
-    /// Set to true when the rayon scope completes
+    /// Set to true when the rayon scope completes (success or panic)
     completed: AtomicBool,
     /// Mutex + Condvar for blocking on cancellation
     completion_lock: Mutex<()>,
@@ -254,7 +260,7 @@ impl<R> Future for ScopedComputeFuture<R> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
         // Try to take result first
         if let Some(result) = self.state.result.lock().take() {
-            return Poll::Ready(result);
+            return Poll::Ready(unwrap_or_resume_panic(result));
         }
 
         // Register/update waker
@@ -265,10 +271,19 @@ impl<R> Future for ScopedComputeFuture<R> {
 
         // Check again in case completion happened between our first check and registration
         if let Some(result) = self.state.result.lock().take() {
-            Poll::Ready(result)
+            Poll::Ready(unwrap_or_resume_panic(result))
         } else {
             Poll::Pending
         }
+    }
+}
+
+/// Unwrap a result or resume the panic if it was a panic payload.
+#[inline]
+fn unwrap_or_resume_panic<R>(result: Result<R, Box<dyn Any + Send>>) -> R {
+    match result {
+        Ok(value) => value,
+        Err(payload) => panic::resume_unwind(payload),
     }
 }
 
@@ -301,6 +316,20 @@ impl<R> ScopedCompletion<R> {
     /// Complete the task with a result. Wakes the waiting future.
     #[inline]
     pub fn complete(self, result: R) {
+        self.complete_with_result(Ok(result));
+    }
+
+    /// Complete the task with a panic payload. Wakes the waiting future.
+    ///
+    /// The panic will be resumed when the future is polled.
+    #[inline]
+    pub fn complete_with_panic(self, payload: Box<dyn Any + Send>) {
+        self.complete_with_result(Err(payload));
+    }
+
+    /// Internal: complete with either success or panic.
+    #[inline]
+    fn complete_with_result(self, result: Result<R, Box<dyn Any + Send>>) {
         // Store the result
         *self.state.result.lock() = Some(result);
 
