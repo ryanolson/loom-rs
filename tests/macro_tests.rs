@@ -48,15 +48,15 @@ async fn test_spawn_async() {
     assert_eq!(result, 100);
 }
 
-/// Test that scope_compute works with borrowed data
+/// Test that scoped_compute works with borrowed data
 #[loom_rs::test]
-async fn test_scope_compute() {
+async fn test_scoped_compute() {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     let data = [1, 2, 3, 4, 5, 6, 7, 8];
     let sum = AtomicI32::new(0);
 
-    loom_rs::scope_compute(|s| {
+    loom_rs::scoped_compute(|s| {
         let (left, right) = data.split_at(data.len() / 2);
         let sum_ref = &sum;
 
@@ -82,13 +82,13 @@ async fn test_install_parallel_iter() {
     assert_eq!(result, 4950);
 }
 
-/// Test that panics in scope_compute propagate correctly
-/// Note: We use scope_compute because it has panic handling.
+/// Test that panics in scoped_compute propagate correctly
+/// Note: We use scoped_compute because it has panic handling.
 /// spawn_compute panics will abort rayon's thread pool.
 #[loom_rs::test]
 #[should_panic(expected = "test panic")]
 async fn test_panic_propagation() {
-    loom_rs::scope_compute(|_s| {
+    loom_rs::scoped_compute(|_s| {
         panic!("test panic");
     })
     .await;
@@ -240,19 +240,19 @@ async fn test_free_function_spawn_compute() {
     assert_eq!(result, 332833500); // sum of squares 0..1000
 }
 
-/// Test using the free function scope_compute with borrowed data.
+/// Test using the free function scoped_compute with borrowed data.
 #[loom_rs::test]
-async fn test_free_function_scope_compute() {
+async fn test_free_function_scoped_compute() {
     let data = [1, 2, 3, 4, 5];
 
-    let sum = loom_rs::scope_compute(|_s| {
+    let sum = loom_rs::scoped_compute(|_s| {
         // Borrow data inside the scope
         data.iter().sum::<i32>()
     })
     .await;
 
     assert_eq!(sum, 15);
-    // data is still valid after scope_compute
+    // data is still valid after scoped_compute
     assert_eq!(data.len(), 5);
 }
 

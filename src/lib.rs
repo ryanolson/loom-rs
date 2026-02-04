@@ -11,7 +11,7 @@
 //! - **Hybrid Runtime**: Combines tokio for async I/O with rayon for CPU-bound parallel work
 //! - **CPU Pinning**: Automatically pins threads to specific CPUs for consistent performance
 //! - **Zero Allocation**: `spawn_compute()` uses per-type pools for zero allocation after warmup
-//! - **Scoped Compute**: `scope_compute()` allows borrowing local data for parallel work
+//! - **Scoped Compute**: `scoped_compute()` allows borrowing local data for parallel work
 //! - **Flexible Configuration**: Configure via files (TOML/YAML/JSON), environment variables, or code
 //! - **CLI Integration**: Built-in clap support for command-line overrides
 //! - **CUDA NUMA Awareness**: Optional feature for selecting CPUs local to a GPU (Linux only)
@@ -181,7 +181,7 @@ pub use metrics::LoomMetrics;
 pub use runtime::LoomRuntime;
 pub use stream::ComputeStreamExt;
 
-// Re-export rayon::Scope for ergonomic use with scope_compute
+// Re-export rayon::Scope for ergonomic use with scoped_compute
 pub use rayon::Scope;
 
 /// Spawn compute work using the current runtime.
@@ -319,7 +319,7 @@ where
 
 /// Execute a scoped parallel computation using the current runtime.
 ///
-/// This is a convenience function for `loom_rs::current_runtime().unwrap().scope_compute(f)`.
+/// This is a convenience function for `loom_rs::current_runtime().unwrap().scoped_compute(f)`.
 /// It allows borrowing local variables from the async context for use in parallel work.
 ///
 /// # Panics
@@ -353,7 +353,7 @@ where
 ///     let sum = AtomicI32::new(0);
 ///
 ///     // Borrow `data` and `sum` for parallel processing - no need to pass &runtime
-///     loom_rs::scope_compute(|s| {
+///     loom_rs::scoped_compute(|s| {
 ///         let (left, right) = data.split_at(data.len() / 2);
 ///         let sum_ref = &sum;
 ///
@@ -369,22 +369,22 @@ where
 ///     println!("Sum of {:?} = {}", data, sum.load(Ordering::Relaxed));
 /// });
 /// ```
-pub async fn scope_compute<'env, F, R>(f: F) -> R
+pub async fn scoped_compute<'env, F, R>(f: F) -> R
 where
     F: FnOnce(&Scope<'env>) -> R + Send + 'env,
     R: Send + 'env,
 {
     current_runtime()
-        .expect("scope_compute called outside loom runtime")
-        .scope_compute(f)
+        .expect("scoped_compute called outside loom runtime")
+        .scoped_compute(f)
         .await
 }
 
 /// Execute scoped work with adaptive sync/async decision using the current runtime.
 ///
-/// This is a convenience function for `loom_rs::current_runtime().unwrap().scope_adaptive(f)`.
+/// This is a convenience function for `loom_rs::current_runtime().unwrap().scoped_adaptive(f)`.
 /// Uses MAB (Multi-Armed Bandit) to learn whether to run synchronously via `install()`
-/// or asynchronously via `scope_compute()`.
+/// or asynchronously via `scoped_compute()`.
 ///
 /// # Panics
 ///
@@ -403,7 +403,7 @@ where
 ///     let sum = AtomicI32::new(0);
 ///
 ///     // MAB learns whether this scoped work should be sync or async
-///     loom_rs::scope_adaptive(|s| {
+///     loom_rs::scoped_adaptive(|s| {
 ///         let (left, right) = data.split_at(data.len() / 2);
 ///         let sum_ref = &sum;
 ///
@@ -416,20 +416,20 @@ where
 ///     }).await;
 /// });
 /// ```
-pub async fn scope_adaptive<'env, F, R>(f: F) -> R
+pub async fn scoped_adaptive<'env, F, R>(f: F) -> R
 where
     F: FnOnce(&Scope<'env>) -> R + Send + 'env,
     R: Send + 'env,
 {
     current_runtime()
-        .expect("scope_adaptive called outside loom runtime")
-        .scope_adaptive(f)
+        .expect("scoped_adaptive called outside loom runtime")
+        .scoped_adaptive(f)
         .await
 }
 
 /// Execute scoped work with adaptive decision and hint using the current runtime.
 ///
-/// Like `scope_adaptive()`, but provides a hint to guide cold-start behavior.
+/// Like `scoped_adaptive()`, but provides a hint to guide cold-start behavior.
 ///
 /// # Panics
 ///
@@ -448,7 +448,7 @@ where
 ///     let sum = AtomicI32::new(0);
 ///
 ///     // Hint that this is likely fast work
-///     loom_rs::scope_adaptive_with_hint(ComputeHint::Low, |s| {
+///     loom_rs::scoped_adaptive_with_hint(ComputeHint::Low, |s| {
 ///         let sum_ref = &sum;
 ///         for &val in &data {
 ///             s.spawn(move |_| {
@@ -458,13 +458,13 @@ where
 ///     }).await;
 /// });
 /// ```
-pub async fn scope_adaptive_with_hint<'env, F, R>(hint: ComputeHint, f: F) -> R
+pub async fn scoped_adaptive_with_hint<'env, F, R>(hint: ComputeHint, f: F) -> R
 where
     F: FnOnce(&Scope<'env>) -> R + Send + 'env,
     R: Send + 'env,
 {
     current_runtime()
-        .expect("scope_adaptive_with_hint called outside loom runtime")
-        .scope_adaptive_with_hint(hint, f)
+        .expect("scoped_adaptive_with_hint called outside loom runtime")
+        .scoped_adaptive_with_hint(hint, f)
         .await
 }

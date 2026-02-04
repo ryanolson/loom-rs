@@ -195,9 +195,14 @@ Threads are named with the configured prefix:
 | `spawn_async()` | I/O-bound async tasks | ~10ns | Yes |
 | `spawn_compute()` | CPU-bound work (always offload) | ~100-500ns | Yes |
 | `spawn_adaptive()` | CPU work (MAB decides inline/offload) | ~50-200ns | Yes |
+| `scoped_compute()` | Borrow local data for parallel work | ~100-500ns | Yes |
+| `scoped_adaptive()` | Scoped work with MAB decisions | ~50-200ns | Yes |
+| `try_spawn_compute()` | Non-panicking compute spawn | ~100-500ns | Yes |
 | `compute_map()` | Stream -> rayon -> stream | ~100-500ns/item | No |
 | `adaptive_map()` | Stream with MAB decisions | ~50-200ns/item | No |
 | `install()` | Zero-overhead parallel iterators | ~0ns | No |
+
+**Note**: `scoped_*` methods allocate ~96 bytes per call (cannot use object pooling since results may contain borrowed references).
 
 ### Shutdown
 
@@ -254,6 +259,37 @@ runtime.block_on(async {
     rt.spawn_async(async { /* ... */ });
 });
 ```
+
+## Scoped Compute
+
+Use `scoped_compute()` to borrow local (non-`'static`) data in parallel work. This is useful when you want to process data in parallel without cloning:
+
+```rust
+use loom_rs::LoomBuilder;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+let runtime = LoomBuilder::new().build()?;
+
+runtime.block_on(async {
+    let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let sum = AtomicI32::new(0);
+
+    // Borrow `data` and `sum` for parallel processing
+    runtime.scoped_compute(|s| {
+        let (left, right) = data.split_at(data.len() / 2);
+
+        s.spawn(|_| sum.fetch_add(left.iter().sum::<i32>(), Ordering::Relaxed));
+        s.spawn(|_| sum.fetch_add(right.iter().sum::<i32>(), Ordering::Relaxed));
+    }).await;
+
+    // `data` and `sum` are still valid here
+    println!("Sum of {:?} = {}", data, sum.load(Ordering::Relaxed));
+});
+```
+
+There's also `scoped_adaptive()` which uses MAB to decide whether to run synchronously via `install()` or asynchronously via `scoped_compute()`.
+
+**Cancellation Safety**: If a scoped future is dropped before completion (e.g., via `select!` or timeout), the drop will block until the rayon scope finishes. This prevents use-after-free of borrowed data.
 
 ## Stream Processing
 
@@ -317,6 +353,20 @@ let result = runtime.spawn_adaptive(|| handle_request(data)).await;
 - **Guardrails**: 4 layers of Tokio starvation protection (GR0-GR3)
 - **Pressure-Aware**: Adjusts decisions based on runtime load
 - **Low Overhead**: ~50-200ns per decision
+
+### Adaptive Hints
+
+Use `ComputeHint` to guide cold-start behavior when the scheduler hasn't learned yet:
+
+```rust
+use loom_rs::ComputeHint;
+
+// Hint that this is likely expensive work - prefer offload initially
+let result = runtime.spawn_adaptive_with_hint(ComputeHint::High, || heavy_work()).await;
+
+// Hint that this is likely fast work - prefer inline initially
+let result = runtime.spawn_adaptive_with_hint(ComputeHint::Low, || quick_work()).await;
+```
 
 See [docs/mab.md](docs/mab.md) for the complete design and configuration options.
 
@@ -431,6 +481,58 @@ let results: Vec<_> = stream
     .collect()
     .await;
 ```
+
+## Testing
+
+loom-rs provides a `#[loom_rs::test]` macro for writing tests that run within a LoomRuntime:
+
+```rust
+#[loom_rs::test]
+async fn test_spawn_compute() {
+    let result = loom_rs::spawn_compute(|| 42).await;
+    assert_eq!(result, 42);
+}
+```
+
+### Default Configuration
+
+- 1 tokio thread
+- 2 rayon threads
+- Thread pinning disabled
+
+### Custom Thread Counts
+
+```rust
+#[loom_rs::test(tokio_thread_count = 2, rayon_thread_count = 4)]
+async fn test_parallel_work() {
+    // Test with more threads
+}
+```
+
+### Result Return Types
+
+The macro supports returning `Result` for integration with test frameworks like `anyhow`:
+
+```rust
+#[loom_rs::test]
+async fn test_with_result() -> anyhow::Result<()> {
+    let result = loom_rs::spawn_compute(|| 42).await;
+    assert_eq!(result, 42);
+    Ok(())
+}
+```
+
+The macro automatically:
+- Creates a runtime with a unique prefix based on the test name
+- Runs the async test body in `block_on()`
+- Waits for all tracked tasks to complete via `block_until_idle()`
+
+## Workspace Structure
+
+loom-rs is organized as a Cargo workspace:
+
+- `loom-rs` - Main runtime crate
+- `loom-macros` - Procedural macros (`#[loom_rs::test]`), automatically included as a dependency
 
 ## License
 

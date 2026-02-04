@@ -662,7 +662,7 @@ impl LoomRuntime {
 
     /// Execute a scoped parallel computation, allowing borrowed data.
     ///
-    /// Unlike `spawn_compute()` which requires `'static` bounds, `scope_compute`
+    /// Unlike `spawn_compute()` which requires `'static` bounds, `scoped_compute`
     /// allows borrowing local variables from the async context for use in parallel
     /// work. This is safe because:
     ///
@@ -715,7 +715,7 @@ impl LoomRuntime {
     ///     let sum = AtomicI32::new(0);
     ///
     ///     // Borrow `data` and `sum` for parallel processing
-    ///     runtime.scope_compute(|s| {
+    ///     runtime.scoped_compute(|s| {
     ///         let (left, right) = data.split_at(data.len() / 2);
     ///
     ///         s.spawn(|_| {
@@ -730,22 +730,22 @@ impl LoomRuntime {
     ///     println!("Sum of {:?} = {}", data, sum.load(Ordering::Relaxed));
     /// });
     /// ```
-    pub async fn scope_compute<'env, F, R>(&self, f: F) -> R
+    pub async fn scoped_compute<'env, F, R>(&self, f: F) -> R
     where
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
     {
-        self.inner.scope_compute(f).await
+        self.inner.scoped_compute(f).await
     }
 
     /// Execute scoped work with adaptive sync/async decision.
     ///
     /// Uses MAB (Multi-Armed Bandit) to learn whether this function type should:
     /// - Run synchronously via `install()` (blocks tokio worker, lower overhead)
-    /// - Run asynchronously via `scope_compute()` (frees tokio worker, higher overhead)
+    /// - Run asynchronously via `scoped_compute()` (frees tokio worker, higher overhead)
     ///
     /// Unlike `spawn_adaptive()` which chooses between inline execution and rayon offload,
-    /// `scope_adaptive` always uses `rayon::scope` (needed for parallel spawning with
+    /// `scoped_adaptive` always uses `rayon::scope` (needed for parallel spawning with
     /// borrowed data), but chooses whether to block the tokio worker or use the async bridge.
     ///
     /// # Performance
@@ -758,12 +758,12 @@ impl LoomRuntime {
     ///
     /// # When to Use
     ///
-    /// Use `scope_adaptive` when:
+    /// Use `scoped_adaptive` when:
     /// - You need to borrow local data (`'env` lifetime)
     /// - You want parallel spawning via `rayon::scope`
     /// - Work duration varies and you want the runtime to learn the best strategy
     ///
-    /// Use `scope_compute` directly when:
+    /// Use `scoped_compute` directly when:
     /// - Work is always slow (> 500µs)
     /// - You want consistent async behavior
     ///
@@ -777,7 +777,7 @@ impl LoomRuntime {
     ///     let sum = AtomicI32::new(0);
     ///
     ///     // MAB learns whether this is fast or slow scoped work
-    ///     runtime.scope_adaptive(|s| {
+    ///     runtime.scoped_adaptive(|s| {
     ///         let (left, right) = data.split_at(data.len() / 2);
     ///         let sum_ref = &sum;
     ///
@@ -792,12 +792,13 @@ impl LoomRuntime {
     ///     println!("Sum: {}", sum.load(Ordering::Relaxed));
     /// });
     /// ```
-    pub async fn scope_adaptive<'env, F, R>(&self, f: F) -> R
+    pub async fn scoped_adaptive<'env, F, R>(&self, f: F) -> R
     where
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
     {
-        self.scope_adaptive_with_hint(ComputeHint::Unknown, f).await
+        self.scoped_adaptive_with_hint(ComputeHint::Unknown, f)
+            .await
     }
 
     /// Execute scoped work with hint for cold-start guidance.
@@ -823,7 +824,7 @@ impl LoomRuntime {
     ///     let sum = AtomicI32::new(0);
     ///
     ///     // Hint that this is likely fast work
-    ///     runtime.scope_adaptive_with_hint(ComputeHint::Low, |s| {
+    ///     runtime.scoped_adaptive_with_hint(ComputeHint::Low, |s| {
     ///         let sum_ref = &sum;
     ///         for &val in &data {
     ///             s.spawn(move |_| {
@@ -833,7 +834,7 @@ impl LoomRuntime {
     ///     }).await;
     /// });
     /// ```
-    pub async fn scope_adaptive_with_hint<'env, F, R>(&self, hint: ComputeHint, f: F) -> R
+    pub async fn scoped_adaptive_with_hint<'env, F, R>(&self, hint: ComputeHint, f: F) -> R
     where
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
@@ -853,7 +854,7 @@ impl LoomRuntime {
             }
             Arm::OffloadRayon => {
                 // Async: frees tokio worker during execution
-                self.scope_compute(f).await
+                self.scoped_compute(f).await
             }
         };
 
@@ -1105,7 +1106,7 @@ impl LoomRuntimeInner {
     /// 4. Therefore, `'env` references outlive all accesses to borrowed data
     ///
     /// This is the same safety argument used by `std::thread::scope`.
-    pub(crate) async fn scope_compute<'env, F, R>(self: &Arc<Self>, f: F) -> R
+    pub(crate) async fn scoped_compute<'env, F, R>(self: &Arc<Self>, f: F) -> R
     where
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
@@ -1613,17 +1614,17 @@ mod tests {
     }
 
     // =============================================================================
-    // scope_compute Tests
+    // scoped_compute Tests
     // =============================================================================
 
     #[test]
-    fn test_scope_compute_basic() {
+    fn test_scoped_compute_basic() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             runtime
-                .scope_compute(|_s| {
+                .scoped_compute(|_s| {
                     // Simple computation without spawning
                     42
                 })
@@ -1634,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_compute_borrow_local_data() {
+    fn test_scoped_compute_borrow_local_data() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
@@ -1642,13 +1643,13 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8];
 
             let sum = runtime
-                .scope_compute(|_s| {
+                .scoped_compute(|_s| {
                     // Borrow data inside the scope
                     data.iter().sum::<i32>()
                 })
                 .await;
 
-            // data is still valid after scope_compute
+            // data is still valid after scoped_compute
             assert_eq!(data.len(), 8);
             sum
         });
@@ -1657,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_compute_parallel_with_atomic() {
+    fn test_scoped_compute_parallel_with_atomic() {
         use std::sync::atomic::{AtomicI32, Ordering};
 
         let mut config = test_config();
@@ -1669,7 +1670,7 @@ mod tests {
             let sum = AtomicI32::new(0);
 
             runtime
-                .scope_compute(|s| {
+                .scoped_compute(|s| {
                     let (left, right) = data.split_at(data.len() / 2);
                     let sum_ref = &sum;
 
@@ -1691,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_compute_nested_spawns() {
+    fn test_scoped_compute_nested_spawns() {
         use std::sync::atomic::{AtomicI32, Ordering};
 
         let config = test_config();
@@ -1702,7 +1703,7 @@ mod tests {
             let sum = AtomicI32::new(0);
 
             runtime
-                .scope_compute(|s| {
+                .scoped_compute(|s| {
                     let data_ref = &data;
                     let sum_ref = &sum;
 
@@ -1731,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_compute_with_rayon_par_iter() {
+    fn test_scoped_compute_with_rayon_par_iter() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
@@ -1739,7 +1740,7 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
             runtime
-                .scope_compute(|_s| {
+                .scoped_compute(|_s| {
                     use rayon::prelude::*;
                     // Use parallel iterators inside the scope
                     data.par_iter().map(|x| x * 2).sum::<i32>()
@@ -1751,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_compute_tracks_compute_tasks() {
+    fn test_scoped_compute_tracks_compute_tasks() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
@@ -1759,7 +1760,7 @@ mod tests {
         assert_eq!(runtime.compute_tasks_in_flight(), 0);
 
         runtime.block_on(async {
-            runtime.scope_compute(|_s| 42).await;
+            runtime.scoped_compute(|_s| 42).await;
         });
 
         // After completion, should be back to 0
@@ -1767,14 +1768,14 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_compute_data_still_valid_after() {
+    fn test_scoped_compute_data_still_valid_after() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             let mut data = vec![1, 2, 3, 4, 5];
 
-            let sum = runtime.scope_compute(|_s| data.iter().sum::<i32>()).await;
+            let sum = runtime.scoped_compute(|_s| data.iter().sum::<i32>()).await;
 
             assert_eq!(sum, 15);
 
@@ -1782,16 +1783,16 @@ mod tests {
             data.push(6);
             assert_eq!(data.len(), 6);
 
-            // Can use scope_compute again with the same data
-            let new_sum = runtime.scope_compute(|_s| data.iter().sum::<i32>()).await;
+            // Can use scoped_compute again with the same data
+            let new_sum = runtime.scoped_compute(|_s| data.iter().sum::<i32>()).await;
             assert_eq!(new_sum, 21);
         });
     }
 
-    /// Test that scope_compute properly yields to the async executor and doesn't block.
+    /// Test that scoped_compute properly yields to the async executor and doesn't block.
     /// This validates the future correctly returns Poll::Pending and wakes up when done.
     #[test]
-    fn test_scope_compute_yields_to_executor() {
+    fn test_scoped_compute_yields_to_executor() {
         use std::sync::mpsc;
         use std::sync::Arc;
         use std::time::Duration;
@@ -1801,26 +1802,26 @@ mod tests {
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
-            // Notify for scope_compute -> async task (sync notify, async wait)
+            // Notify for scoped_compute -> async task (sync notify, async wait)
             let scope_started = Arc::new(Notify::new());
             let scope_started_clone = scope_started.clone();
 
-            // Channel for async task -> scope_compute (non-blocking send, blocking recv)
+            // Channel for async task -> scoped_compute (non-blocking send, blocking recv)
             let (async_responded_tx, async_responded_rx) = mpsc::channel();
 
-            // Spawn async task that waits for scope_compute to start, then responds
+            // Spawn async task that waits for scoped_compute to start, then responds
             let concurrent_handle = runtime.spawn_async(async move {
-                // Wait for scope_compute to signal it started (async wait - doesn't block tokio)
+                // Wait for scoped_compute to signal it started (async wait - doesn't block tokio)
                 scope_started_clone.notified().await;
                 // Signal back that we received it (non-blocking send)
                 async_responded_tx.send(()).unwrap();
                 100
             });
 
-            // Run scope_compute with round-trip handshake
+            // Run scoped_compute with round-trip handshake
             // Move receiver into the closure (FnOnce) so it's owned, not borrowed
             let result = runtime
-                .scope_compute(move |_s| {
+                .scoped_compute(move |_s| {
                     // Signal that we've started (wakes the async task)
                     scope_started.notify_one();
                     // Wait for async task to respond (blocking recv on rayon thread is fine)
@@ -1840,10 +1841,10 @@ mod tests {
         });
     }
 
-    /// Test that mirrors the documentation example for scope_compute.
+    /// Test that mirrors the documentation example for scoped_compute.
     /// This ensures the example code actually compiles and works.
     #[test]
-    fn test_scope_compute_doc_example() {
+    fn test_scoped_compute_doc_example() {
         use std::sync::atomic::{AtomicI32, Ordering};
 
         let config = test_config();
@@ -1854,7 +1855,7 @@ mod tests {
             let sum = AtomicI32::new(0);
 
             runtime
-                .scope_compute(|s| {
+                .scoped_compute(|s| {
                     let (left, right) = data.split_at(data.len() / 2);
                     let sum_ref = &sum;
 
@@ -1867,7 +1868,7 @@ mod tests {
                 })
                 .await;
 
-            // Verify data is still accessible after scope_compute
+            // Verify data is still accessible after scoped_compute
             assert_eq!(data.len(), 8);
             sum.load(Ordering::Relaxed)
         });
@@ -1875,10 +1876,10 @@ mod tests {
         assert_eq!(result, 36); // 1+2+3+4+5+6+7+8 = 36
     }
 
-    /// Test that scope_compute works correctly with tokio::select! (cancellation scenario).
+    /// Test that scoped_compute works correctly with tokio::select! (cancellation scenario).
     /// The future should block on drop until the scope completes.
     #[test]
-    fn test_scope_compute_cancellation_safety() {
+    fn test_scoped_compute_cancellation_safety() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
@@ -1890,17 +1891,17 @@ mod tests {
             let scope_completed = Arc::new(AtomicBool::new(false));
             let scope_completed_clone = scope_completed.clone();
 
-            // Use select! to race scope_compute against a timeout
-            // The scope_compute will "lose" but should still complete before we continue
+            // Use select! to race scoped_compute against a timeout
+            // The scoped_compute will "lose" but should still complete before we continue
             let result = tokio::select! {
                 biased;
 
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                    // Timeout wins - this drops the scope_compute future
+                    // Timeout wins - this drops the scoped_compute future
                     // But drop should block until scope completes
                     None
                 }
-                result = runtime.scope_compute(|_s| {
+                result = runtime.scoped_compute(|_s| {
                     // This takes longer than the timeout
                     std::thread::sleep(Duration::from_millis(50));
                     scope_completed_clone.store(true, Ordering::Release);
@@ -1921,33 +1922,33 @@ mod tests {
         });
     }
 
-    /// Test that panics inside scope_compute are properly propagated to the awaiter.
+    /// Test that panics inside scoped_compute are properly propagated to the awaiter.
     #[test]
     #[should_panic(expected = "intentional panic for testing")]
-    fn test_scope_compute_panic_propagation() {
+    fn test_scoped_compute_panic_propagation() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             runtime
-                .scope_compute(|_s| {
+                .scoped_compute(|_s| {
                     panic!("intentional panic for testing");
                 })
                 .await
         });
     }
 
-    /// Test that panics in spawned work inside scope_compute are properly propagated.
+    /// Test that panics in spawned work inside scoped_compute are properly propagated.
     #[test]
     #[should_panic(expected = "panic in spawned work")]
-    fn test_scope_compute_spawned_panic_propagation() {
+    fn test_scoped_compute_spawned_panic_propagation() {
         let mut config = test_config();
         config.rayon_threads = Some(2);
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             runtime
-                .scope_compute(|s| {
+                .scoped_compute(|s| {
                     s.spawn(|_| {
                         panic!("panic in spawned work");
                     });
@@ -1957,17 +1958,17 @@ mod tests {
     }
 
     // =============================================================================
-    // scope_adaptive Tests
+    // scoped_adaptive Tests
     // =============================================================================
 
     #[test]
-    fn test_scope_adaptive_basic() {
+    fn test_scoped_adaptive_basic() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             runtime
-                .scope_adaptive(|_s| {
+                .scoped_adaptive(|_s| {
                     // Simple computation without spawning
                     42
                 })
@@ -1978,13 +1979,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_adaptive_with_hint() {
+    fn test_scoped_adaptive_with_hint() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         let result = runtime.block_on(async {
             runtime
-                .scope_adaptive_with_hint(crate::ComputeHint::Low, |_s| 100)
+                .scoped_adaptive_with_hint(crate::ComputeHint::Low, |_s| 100)
                 .await
         });
 
@@ -1992,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_adaptive_borrow_local_data() {
+    fn test_scoped_adaptive_borrow_local_data() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
@@ -2000,13 +2001,13 @@ mod tests {
             let data = [1, 2, 3, 4, 5, 6, 7, 8];
 
             let sum = runtime
-                .scope_adaptive(|_s| {
+                .scoped_adaptive(|_s| {
                     // Borrow data inside the scope
                     data.iter().sum::<i32>()
                 })
                 .await;
 
-            // data is still valid after scope_adaptive
+            // data is still valid after scoped_adaptive
             assert_eq!(data.len(), 8);
             sum
         });
@@ -2015,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_adaptive_parallel_with_atomic() {
+    fn test_scoped_adaptive_parallel_with_atomic() {
         use std::sync::atomic::{AtomicI32, Ordering};
 
         let mut config = test_config();
@@ -2027,7 +2028,7 @@ mod tests {
             let sum = AtomicI32::new(0);
 
             runtime
-                .scope_adaptive(|s| {
+                .scoped_adaptive(|s| {
                     let (left, right) = data.split_at(data.len() / 2);
                     let sum_ref = &sum;
 
@@ -2049,14 +2050,14 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_adaptive_records_metrics() {
+    fn test_scoped_adaptive_records_metrics() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             // Run some adaptive tasks
             for _ in 0..10 {
-                runtime.scope_adaptive(|_s| std::hint::black_box(42)).await;
+                runtime.scoped_adaptive(|_s| std::hint::black_box(42)).await;
             }
         });
 
@@ -2070,17 +2071,17 @@ mod tests {
         );
     }
 
-    /// Test that panics inside scope_adaptive are properly propagated.
+    /// Test that panics inside scoped_adaptive are properly propagated.
     #[test]
-    #[should_panic(expected = "intentional panic in scope_adaptive")]
-    fn test_scope_adaptive_panic_propagation() {
+    #[should_panic(expected = "intentional panic in scoped_adaptive")]
+    fn test_scoped_adaptive_panic_propagation() {
         let config = test_config();
         let runtime = LoomRuntime::from_config(config).unwrap();
 
         runtime.block_on(async {
             runtime
-                .scope_adaptive(|_s| {
-                    panic!("intentional panic in scope_adaptive");
+                .scoped_adaptive(|_s| {
+                    panic!("intentional panic in scoped_adaptive");
                 })
                 .await
         });
