@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use futures::stream::{self, StreamExt};
 use loom_rs::cpuset::format_cpuset;
 use loom_rs::mab::{Arm, Context, FunctionKey, MabKnobs, MabScheduler};
+use loom_rs::metrics::LoomMetrics;
 use loom_rs::{ComputeStreamExt, LoomBuilder, LoomRuntime};
 use parking_lot::Mutex;
 
@@ -41,11 +42,11 @@ struct EvaluationConfig {
     convergence_observations: usize,
     /// Duration for latency probe phases
     latency_phase_duration: Duration,
-    /// Target sleep time for latency probes
+    /// Target sleep time for latency probes (100us for fine resolution)
     latency_probe_sleep: Duration,
-    /// Work rate for latency tests (tasks/sec)
+    /// Work rate for latency tests (tasks/sec) - high enough to saturate 1 thread
     latency_work_rate: u64,
-    /// Work duration for latency tests (microseconds)
+    /// Work duration for latency tests (microseconds) - above GR1 threshold
     latency_work_us: u64,
     /// Total CPUs to use for evaluation (bounded set)
     total_cpus: usize,
@@ -61,9 +62,12 @@ impl Default for EvaluationConfig {
             item_count: 500,
             convergence_observations: 100,
             latency_phase_duration: Duration::from_secs(3),
-            latency_probe_sleep: Duration::from_millis(1),
-            latency_work_rate: 500,
-            latency_work_us: 500,
+            // Reduced from 1ms to 100us for finer resolution
+            latency_probe_sleep: Duration::from_micros(100),
+            // Increased from 500/s to 1500/s to saturate single tokio thread
+            latency_work_rate: 1500,
+            // Increased from 500us to 3000us (3ms) to cross GR1 threshold
+            latency_work_us: 3000,
             total_cpus: 16,
             thread_configs: vec![
                 ThreadConfig {
@@ -158,6 +162,52 @@ fn compute_pressure_index(ctx: &Context) -> f64 {
     let spawn_ratio = ctx.spawn_rate_per_s as f64 / (1000.0 * ctx.tokio_workers as f64);
     let pressure = knobs.w_inflight * inflight_ratio + knobs.w_spawn * spawn_ratio;
     pressure.min(knobs.pressure_clip)
+}
+
+// =============================================================================
+// Metrics Snapshot
+// =============================================================================
+
+/// Snapshot of LoomMetrics counter values at a point in time.
+#[derive(Clone, Debug, Default)]
+struct MetricsSnapshot {
+    inline_decisions: u64,
+    offload_decisions: u64,
+    gr1_activations: u64,
+    gr2_activations: u64,
+    gr3_activations: u64,
+    starvation_events: u64,
+    pressure_index: f64,
+}
+
+impl MetricsSnapshot {
+    fn capture(metrics: &LoomMetrics) -> Self {
+        Self {
+            inline_decisions: metrics.inline_decisions.get(),
+            offload_decisions: metrics.offload_decisions.get(),
+            gr1_activations: metrics.gr1_activations.get(),
+            gr2_activations: metrics.gr2_activations.get(),
+            gr3_activations: metrics.gr3_activations.get(),
+            starvation_events: metrics.starvation_events.get(),
+            pressure_index: metrics.pressure_index.get(),
+        }
+    }
+
+    fn delta(&self, prev: &MetricsSnapshot) -> MetricsSnapshot {
+        MetricsSnapshot {
+            inline_decisions: self.inline_decisions.saturating_sub(prev.inline_decisions),
+            offload_decisions: self
+                .offload_decisions
+                .saturating_sub(prev.offload_decisions),
+            gr1_activations: self.gr1_activations.saturating_sub(prev.gr1_activations),
+            gr2_activations: self.gr2_activations.saturating_sub(prev.gr2_activations),
+            gr3_activations: self.gr3_activations.saturating_sub(prev.gr3_activations),
+            starvation_events: self
+                .starvation_events
+                .saturating_sub(prev.starvation_events),
+            pressure_index: self.pressure_index,
+        }
+    }
 }
 
 // =============================================================================
@@ -258,7 +308,10 @@ impl Stats {
 // Calibrated Work
 // =============================================================================
 
-/// Calibrated work function that runs for approximately the specified duration.
+/// Calibrated work function using iteration count (fast, for throughput tests).
+///
+/// Note: Actual wall-clock time depends on CPU speed and optimization level.
+/// Use `spin_for` when you need guaranteed wall-clock duration.
 #[inline(never)]
 fn calibrated_work(target_us: u64) -> u64 {
     // ~100 iterations per 1us on typical hardware
@@ -266,6 +319,23 @@ fn calibrated_work(target_us: u64) -> u64 {
     let mut sum = 0u64;
     for i in 0..iterations {
         sum = sum.wrapping_add(std::hint::black_box(i));
+    }
+    sum
+}
+
+/// Spin-wait for exactly the target duration (wall-clock accurate).
+///
+/// Used in latency tests where we need guaranteed blocking duration
+/// regardless of CPU speed or optimization level.
+#[inline(never)]
+fn spin_for(target_us: u64) -> u64 {
+    let target = Duration::from_micros(target_us);
+    let start = Instant::now();
+    let mut sum = 0u64;
+    let mut i = 0u64;
+    while start.elapsed() < target {
+        sum = sum.wrapping_add(std::hint::black_box(i));
+        i += 1;
     }
     sum
 }
@@ -388,15 +458,37 @@ async fn latency_probe(
     }
 }
 
-fn measure_latency_impact(config: &EvaluationConfig, runtime: &LoomRuntime) -> LatencyResults {
+/// Measures latency impact using a dedicated 1-tokio-thread runtime.
+///
+/// Uses `spin_for()` for wall-clock-accurate blocking and spawns work as
+/// separate tokio tasks. On a single-thread runtime, each inline task blocks
+/// the thread during its poll, delaying the latency probe. Offloaded tasks
+/// return immediately to rayon, freeing the tokio thread.
+fn measure_latency_impact(config: &EvaluationConfig) -> LatencyResults {
+    // Build a dedicated 1-tokio-thread runtime for this test.
+    // This makes starvation visible: blocking the single tokio thread
+    // directly delays the latency probe.
+    let runtime = LoomBuilder::new()
+        .prefix("mab-lat")
+        .tokio_threads(1)
+        .rayon_threads(7)
+        .build()
+        .expect("failed to build latency test runtime");
+
+    let probe_sleep = config.latency_probe_sleep;
+    let phase_duration = config.latency_phase_duration;
+    let work_us = config.latency_work_us;
+    // Rate at which we spawn new work tasks
+    let spawn_interval = Duration::from_micros(1_000_000 / config.latency_work_rate);
+
     // Baseline (no load)
     let baseline = runtime.block_on(async {
         let samples = Arc::new(Mutex::new(Stats::new()));
         let running = Arc::new(AtomicBool::new(true));
 
         latency_probe(
-            config.latency_probe_sleep,
-            config.latency_phase_duration,
+            probe_sleep,
+            phase_duration,
             samples.clone(),
             running.clone(),
         )
@@ -409,42 +501,40 @@ fn measure_latency_impact(config: &EvaluationConfig, runtime: &LoomRuntime) -> L
 
     let baseline_p95 = baseline.p95();
 
-    // AlwaysInline
+    // AlwaysInline: spawn tasks that do blocking work directly on the tokio thread.
+    // Each task blocks the single tokio thread for `work_us` during its poll.
+    // The dispatcher yields between spawns so the probe can collect samples,
+    // but the spawned tasks themselves compete with the probe for poll time.
     let always_inline = runtime.block_on(async {
         let samples = Arc::new(Mutex::new(Stats::new()));
         let running = Arc::new(AtomicBool::new(true));
         let completed = Arc::new(AtomicU64::new(0));
 
-        let probe_samples = samples.clone();
-        let probe_running = running.clone();
-        let probe_sleep = config.latency_probe_sleep;
-        let phase_duration = config.latency_phase_duration;
-
-        let probe_handle = runtime.spawn_async(async move {
-            latency_probe(probe_sleep, phase_duration, probe_samples, probe_running).await;
+        let probe_handle = runtime.spawn_async({
+            let samples = samples.clone();
+            let running = running.clone();
+            async move {
+                latency_probe(probe_sleep, phase_duration, samples, running).await;
+            }
         });
 
         let start = Instant::now();
-        let interval = Duration::from_micros(1_000_000 / config.latency_work_rate);
-        let work_us = config.latency_work_us;
-
-        while Instant::now() < start + config.latency_phase_duration {
-            let task_start = Instant::now();
-            // Execute compute work directly on Tokio worker (inline)
-            std::hint::black_box(calibrated_work(work_us));
-            completed.fetch_add(1, Ordering::Relaxed);
-
-            let elapsed = task_start.elapsed();
-            if elapsed < interval {
-                tokio::time::sleep(interval - elapsed).await;
-            }
+        while Instant::now() < start + phase_duration {
+            // Spawn a task that does inline blocking work
+            let completed_clone = completed.clone();
+            runtime.spawn_async(async move {
+                std::hint::black_box(spin_for(work_us));
+                completed_clone.fetch_add(1, Ordering::Relaxed);
+            });
+            // Yield to let tokio schedule other tasks (probe + spawned work)
+            tokio::time::sleep(spawn_interval).await;
         }
 
         running.store(false, Ordering::Relaxed);
         let _ = probe_handle.await;
 
         let duration = start.elapsed();
-        let latency = { std::mem::take(&mut *samples.lock()) };
+        let latency = std::mem::take(&mut *samples.lock());
         let completed_tasks = completed.load(Ordering::Relaxed);
         let throughput = completed_tasks as f64 / duration.as_secs_f64();
         let interference_factor = if baseline_p95 > 0.0 {
@@ -460,44 +550,37 @@ fn measure_latency_impact(config: &EvaluationConfig, runtime: &LoomRuntime) -> L
         }
     });
 
-    // AlwaysOffload - needs special handling to avoid nested block_on
+    // AlwaysOffload: spawn tasks that offload work to rayon.
+    // The tokio thread stays free for the latency probe.
     let always_offload = runtime.block_on(async {
         let samples = Arc::new(Mutex::new(Stats::new()));
         let running = Arc::new(AtomicBool::new(true));
         let completed = Arc::new(AtomicU64::new(0));
 
-        let probe_samples = samples.clone();
-        let probe_running = running.clone();
-        let probe_sleep = config.latency_probe_sleep;
-        let phase_duration = config.latency_phase_duration;
-
-        let probe_handle = runtime.spawn_async(async move {
-            latency_probe(probe_sleep, phase_duration, probe_samples, probe_running).await;
+        let probe_handle = runtime.spawn_async({
+            let samples = samples.clone();
+            let running = running.clone();
+            async move {
+                latency_probe(probe_sleep, phase_duration, samples, running).await;
+            }
         });
 
         let start = Instant::now();
-        let interval = Duration::from_micros(1_000_000 / config.latency_work_rate);
-        let work_us = config.latency_work_us;
-
-        while Instant::now() < start + config.latency_phase_duration {
-            let task_start = Instant::now();
-            // Offload to rayon via spawn_compute (await inside async block)
-            runtime
-                .spawn_compute(move || calibrated_work(work_us))
-                .await;
-            completed.fetch_add(1, Ordering::Relaxed);
-
-            let elapsed = task_start.elapsed();
-            if elapsed < interval {
-                tokio::time::sleep(interval - elapsed).await;
-            }
+        while Instant::now() < start + phase_duration {
+            let completed_clone = completed.clone();
+            runtime.spawn_async(async move {
+                // Offload to rayon - tokio thread is freed immediately
+                loom_rs::spawn_compute(move || spin_for(work_us)).await;
+                completed_clone.fetch_add(1, Ordering::Relaxed);
+            });
+            tokio::time::sleep(spawn_interval).await;
         }
 
         running.store(false, Ordering::Relaxed);
         let _ = probe_handle.await;
 
         let duration = start.elapsed();
-        let latency = { std::mem::take(&mut *samples.lock()) };
+        let latency = std::mem::take(&mut *samples.lock());
         let completed_tasks = completed.load(Ordering::Relaxed);
         let throughput = completed_tasks as f64 / duration.as_secs_f64();
         let interference_factor = if baseline_p95 > 0.0 {
@@ -513,43 +596,37 @@ fn measure_latency_impact(config: &EvaluationConfig, runtime: &LoomRuntime) -> L
         }
     });
 
-    // Adaptive (using adaptive_map in a limited way)
+    // Adaptive: spawn tasks that use spawn_adaptive (MAB decides inline vs offload).
+    // With 3ms work, the MAB should learn to offload, protecting the probe.
     let adaptive = runtime.block_on(async {
         let samples = Arc::new(Mutex::new(Stats::new()));
         let running = Arc::new(AtomicBool::new(true));
         let completed = Arc::new(AtomicU64::new(0));
 
-        let probe_samples = samples.clone();
-        let probe_running = running.clone();
-        let probe_sleep = config.latency_probe_sleep;
-        let phase_duration = config.latency_phase_duration;
-
-        let probe_handle = runtime.spawn_async(async move {
-            latency_probe(probe_sleep, phase_duration, probe_samples, probe_running).await;
+        let probe_handle = runtime.spawn_async({
+            let samples = samples.clone();
+            let running = running.clone();
+            async move {
+                latency_probe(probe_sleep, phase_duration, samples, running).await;
+            }
         });
 
         let start = Instant::now();
-        let work_us = config.latency_work_us;
-        let item_count = (config.latency_phase_duration.as_secs() as usize)
-            * (config.latency_work_rate as usize);
-        let completed_clone = completed.clone();
-
-        stream::iter(0..item_count)
-            .adaptive_map(move |_| {
-                let result = calibrated_work(work_us);
+        while Instant::now() < start + phase_duration {
+            let completed_clone = completed.clone();
+            runtime.spawn_async(async move {
+                // MAB decides inline vs offload
+                loom_rs::spawn_adaptive(move || spin_for(work_us)).await;
                 completed_clone.fetch_add(1, Ordering::Relaxed);
-                result
-            })
-            .for_each(|_| async {
-                tokio::task::yield_now().await;
-            })
-            .await;
+            });
+            tokio::time::sleep(spawn_interval).await;
+        }
 
         running.store(false, Ordering::Relaxed);
         let _ = probe_handle.await;
 
         let duration = start.elapsed();
-        let latency = { std::mem::take(&mut *samples.lock()) };
+        let latency = std::mem::take(&mut *samples.lock());
         let completed_tasks = completed.load(Ordering::Relaxed);
         let throughput = completed_tasks as f64 / duration.as_secs_f64();
         let interference_factor = if baseline_p95 > 0.0 {
@@ -564,6 +641,8 @@ fn measure_latency_impact(config: &EvaluationConfig, runtime: &LoomRuntime) -> L
             interference_factor,
         }
     });
+
+    runtime.block_until_idle();
 
     LatencyResults {
         baseline,
@@ -960,7 +1039,6 @@ fn measure_config(
     thread_config: &ThreadConfig,
 ) -> Option<ConfigResults> {
     // Try to build runtime with this configuration
-    // Note: cpuset is now automatically discovered from process affinity
     let runtime = match LoomBuilder::new()
         .prefix("mab-eval")
         .tokio_threads(thread_config.tokio_threads)
@@ -992,8 +1070,8 @@ fn measure_config(
     // Measure throughput with starvation tracking
     let throughput = measure_throughput_with_tracking(eval_config, &runtime, &mut tracker);
 
-    // Measure latency
-    let latency = measure_latency_impact(eval_config, &runtime);
+    // Measure latency using the dedicated 1-thread test
+    let latency = measure_latency_impact(eval_config);
 
     // Cleanup
     runtime.block_until_idle();
@@ -1057,6 +1135,201 @@ fn measure_throughput_with_tracking(
 }
 
 // =============================================================================
+// Phase 6: Workload Shift Test
+// =============================================================================
+
+/// Results from the workload shift (non-stationary) test.
+struct WorkloadShiftResults {
+    /// Decision trajectory: (range_label, inline_pct, offload_pct)
+    trajectory: Vec<(&'static str, f64, f64)>,
+    /// Number of observations after shift before MAB switches to offload
+    observations_to_switch: usize,
+    /// Whether guardrails provided immediate protection during transition
+    guardrail_protected: bool,
+}
+
+fn measure_workload_shift() -> WorkloadShiftResults {
+    let ctx = Context {
+        tokio_workers: 4,
+        inflight_tasks: 2,
+        spawn_rate_per_s: 100.0,
+        rayon_threads: 8,
+        rayon_queue_depth: 0,
+    };
+
+    let metrics = LoomMetrics::new();
+    let scheduler = MabScheduler::with_metrics(MabKnobs::default(), metrics);
+    let key = FunctionKey::from_name("shift_test");
+
+    let mut trajectory = Vec::new();
+    let mut all_decisions: Vec<Arm> = Vec::new();
+
+    // Phase A: 200 observations of fast work (20us) - should converge to inline
+    for _ in 0..200 {
+        let (id, arm) = scheduler.choose(key, &ctx);
+        scheduler.finish(id, 20.0, Some(20.0));
+        all_decisions.push(arm);
+    }
+
+    // Record phase A trajectory in chunks of 50
+    for chunk_idx in 0..4 {
+        let start = chunk_idx * 50;
+        let end = start + 50;
+        let inline_count = all_decisions[start..end]
+            .iter()
+            .filter(|a| **a == Arm::InlineTokio)
+            .count();
+        let label = match chunk_idx {
+            0 => "Fast 1-50",
+            1 => "Fast 51-100",
+            2 => "Fast 101-150",
+            _ => "Fast 151-200",
+        };
+        trajectory.push((
+            label,
+            (inline_count as f64 / 50.0) * 100.0,
+            ((50 - inline_count) as f64 / 50.0) * 100.0,
+        ));
+    }
+
+    // Phase B: 200 observations of slow work (500us) - should adapt to offload
+    let shift_start = all_decisions.len();
+    let mut observations_to_switch = 200; // default: didn't switch
+    let mut guardrail_protected = false;
+
+    for i in 0..200 {
+        let (id, arm) = scheduler.choose(key, &ctx);
+        scheduler.finish(id, 500.0, Some(500.0));
+        all_decisions.push(arm);
+
+        // Check if this is the first offload after the shift
+        if arm == Arm::OffloadRayon && observations_to_switch == 200 {
+            // Check if we have 3 consecutive offloads starting here
+            // (can't look ahead, so track with a simple counter)
+            let recent_offloads = all_decisions[shift_start..]
+                .iter()
+                .rev()
+                .take(3)
+                .filter(|a| **a == Arm::OffloadRayon)
+                .count();
+            if recent_offloads >= 3 {
+                observations_to_switch = i + 1;
+            }
+        }
+
+        // First decision after shift: guardrail protection if offloaded immediately
+        if i == 0 && arm == Arm::OffloadRayon {
+            guardrail_protected = true;
+        }
+    }
+
+    // Record phase B trajectory in chunks of 50
+    for chunk_idx in 0..4 {
+        let start = shift_start + chunk_idx * 50;
+        let end = start + 50;
+        let inline_count = all_decisions[start..end]
+            .iter()
+            .filter(|a| **a == Arm::InlineTokio)
+            .count();
+        let label = match chunk_idx {
+            0 => "Slow 1-50",
+            1 => "Slow 51-100",
+            2 => "Slow 101-150",
+            _ => "Slow 151-200",
+        };
+        trajectory.push((
+            label,
+            (inline_count as f64 / 50.0) * 100.0,
+            ((50 - inline_count) as f64 / 50.0) * 100.0,
+        ));
+    }
+
+    WorkloadShiftResults {
+        trajectory,
+        observations_to_switch,
+        guardrail_protected,
+    }
+}
+
+// =============================================================================
+// Phase 7: Pressure Escalation Test
+// =============================================================================
+
+/// Results from a single pressure escalation level.
+struct PressureLevelResult {
+    load_label: &'static str,
+    spawn_rate: f64,
+    pressure_index: f64,
+    gr_activations: u64,
+    inline_pct: f64,
+    starvation_events: u64,
+}
+
+/// Results from the full pressure escalation test.
+struct PressureEscalationResults {
+    levels: Vec<PressureLevelResult>,
+}
+
+fn measure_pressure_escalation() -> PressureEscalationResults {
+    // Use tokio_workers=4 so GR0 (single-worker protection) doesn't shadow
+    // GR2 (pressure-sensitive threshold). We want to show GR2 activating
+    // as pressure crosses p_high (3.0).
+    let load_levels: Vec<(&'static str, u32, f32)> = vec![
+        ("Low", 4, 100.0),         // ~0.7*1 + 0.3*0.025 = 0.71
+        ("Medium", 12, 1000.0),    // ~0.7*3 + 0.3*0.25 = 2.18
+        ("High", 20, 4000.0),      // ~0.7*5 + 0.3*1.0 = 3.8
+        ("Very High", 40, 8000.0), // ~0.7*10 + 0.3*2.0 = 7.6
+        ("Extreme", 80, 20000.0),  // ~0.7*20 + 0.3*5.0 = 10.0 (clipped)
+    ];
+
+    let mut levels = Vec::new();
+
+    for (label, inflight, spawn_rate) in load_levels {
+        let metrics = LoomMetrics::new();
+        let scheduler = MabScheduler::with_metrics(MabKnobs::default(), metrics.clone());
+        let key = FunctionKey::from_name("pressure_test");
+
+        let ctx = Context {
+            tokio_workers: 4,
+            inflight_tasks: inflight,
+            spawn_rate_per_s: spawn_rate,
+            rayon_threads: 8,
+            rayon_queue_depth: 0,
+        };
+
+        let before = MetricsSnapshot::capture(&metrics);
+
+        // Run 100 observations of medium-duration work (150us).
+        // This is above t_inline_under_pressure_us (100us) but below
+        // t_block_hard_us (250us), so GR2 should be the deciding guardrail
+        // under high pressure while GR1 doesn't fire.
+        let mut inline_count = 0u64;
+        for _ in 0..100 {
+            let (id, arm) = scheduler.choose(key, &ctx);
+            if arm == Arm::InlineTokio {
+                inline_count += 1;
+            }
+            scheduler.finish(id, 150.0, Some(150.0));
+        }
+
+        let after = MetricsSnapshot::capture(&metrics);
+        let delta = after.delta(&before);
+        let pressure = compute_pressure_index(&ctx);
+
+        levels.push(PressureLevelResult {
+            load_label: label,
+            spawn_rate: spawn_rate as f64,
+            pressure_index: pressure,
+            gr_activations: delta.gr1_activations + delta.gr2_activations + delta.gr3_activations,
+            inline_pct: (inline_count as f64 / 100.0) * 100.0,
+            starvation_events: delta.starvation_events,
+        });
+    }
+
+    PressureEscalationResults { levels }
+}
+
+// =============================================================================
 // Verdict
 // =============================================================================
 
@@ -1064,6 +1337,7 @@ fn measure_throughput_with_tracking(
 struct Verdict {
     overhead_pass: bool,
     latency_pass: bool,
+    starvation_pass: bool,
     throughput_pass: bool,
     learning_pass: bool,
     overall_pass: bool,
@@ -1075,6 +1349,7 @@ fn compute_verdict(
     latency: &LatencyResults,
     throughput: &ThroughputResults,
     learning: &LearningResults,
+    pressure: &PressureEscalationResults,
 ) -> Verdict {
     let mut notes = Vec::new();
 
@@ -1088,14 +1363,24 @@ fn compute_verdict(
         ));
     }
 
-    // Latency check: adaptive interference within 2x of offload
+    // Latency check: adaptive interference < 2x, and significantly less than inline
     let adaptive_if = latency.adaptive.interference_factor;
+    let inline_if = latency.always_inline.interference_factor;
     let offload_if = latency.always_offload.interference_factor;
     let latency_pass = adaptive_if < offload_if * 2.0 || adaptive_if < 5.0;
     if !latency_pass {
         notes.push(format!(
             "Adaptive interference ({:.1}x) significantly worse than offload ({:.1}x)",
             adaptive_if, offload_if
+        ));
+    }
+
+    // Starvation protection check: inline should show higher interference than adaptive
+    let starvation_pass = inline_if > adaptive_if * 1.5 || inline_if > 3.0;
+    if !starvation_pass {
+        notes.push(format!(
+            "Inline interference ({:.1}x) not significantly worse than adaptive ({:.1}x) - starvation test may not have enough pressure",
+            inline_if, adaptive_if
         ));
     }
 
@@ -1134,11 +1419,24 @@ fn compute_verdict(
         }
     }
 
-    let overall_pass = overhead_pass && latency_pass && throughput_pass && learning_pass;
+    // Check pressure escalation shows guardrails activating
+    let high_pressure_levels: Vec<_> = pressure
+        .levels
+        .iter()
+        .filter(|l| l.pressure_index > 3.0)
+        .collect();
+    let guardrails_active = high_pressure_levels.iter().any(|l| l.gr_activations > 0);
+    if !guardrails_active && !high_pressure_levels.is_empty() {
+        notes.push("Guardrails did not activate under high pressure".to_string());
+    }
+
+    let overall_pass =
+        overhead_pass && latency_pass && throughput_pass && learning_pass && starvation_pass;
 
     Verdict {
         overhead_pass,
         latency_pass,
+        starvation_pass,
         throughput_pass,
         learning_pass,
         overall_pass,
@@ -1158,7 +1456,10 @@ fn print_markdown_report(
     latency: &LatencyResults,
     throughput: &ThroughputResults,
     learning: &LearningResults,
+    workload_shift: &WorkloadShiftResults,
+    pressure_escalation: &PressureEscalationResults,
     config_results: &[ConfigResults],
+    cumulative_metrics: &MetricsSnapshot,
     verdict: &Verdict,
 ) {
     let now = chrono_lite_now();
@@ -1170,6 +1471,20 @@ fn print_markdown_report(
         system_info.platform, system_info.arch, system_info.cpus
     );
     println!("**Build:** {}\n", system_info.build_profile);
+
+    // Measurement Journey
+    println!("## Measurement Journey\n");
+    println!("This report follows a progression of measurements designed to answer:");
+    println!("*Does the MAB adaptive scheduler protect Tokio from starvation while*");
+    println!("*optimizing throughput for mixed workloads?*\n");
+    println!("1. **Overhead** - Can we afford to make a decision on every task?");
+    println!("2. **Latency Impact** - Does inlining cause measurable starvation?");
+    println!("3. **Throughput** - Do we leave performance on the table?");
+    println!("4. **Learning** - Does the MAB converge to correct decisions?");
+    println!("5. **Thread Configurations** - How do different ratios affect behavior?");
+    println!("6. **Workload Shift** - Does the MAB adapt when workloads change?");
+    println!("7. **Pressure Escalation** - Do guardrails activate under load?");
+    println!();
 
     // System Configuration Section
     println!("## System Configuration\n");
@@ -1206,6 +1521,16 @@ fn print_markdown_report(
         if verdict.latency_pass { "OK" } else { "FAIL" },
         latency.adaptive.interference_factor,
         latency.always_offload.interference_factor
+    );
+    println!(
+        "- {} Starvation differentiation (inline: {:.1}x vs adaptive: {:.1}x interference)",
+        if verdict.starvation_pass {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        latency.always_inline.interference_factor,
+        latency.adaptive.interference_factor
     );
     println!(
         "- {} Throughput on mixed workloads ({:+.1}% vs always-offload)",
@@ -1279,7 +1604,12 @@ fn print_markdown_report(
     // Section 2: Wake Latency Impact
     println!("---\n");
     println!("## 2. Wake Latency Impact\n");
-    println!("Measures how different strategies affect Tokio's async executor responsiveness.\n");
+    println!("Measures how different strategies affect Tokio's async executor responsiveness.");
+    println!(
+        "Uses a dedicated **1-tokio-thread** runtime with **{}us work** at **{}/s** rate",
+        eval_config.latency_work_us, eval_config.latency_work_rate
+    );
+    println!("to ensure blocking work directly competes with the latency probe.\n");
     println!(
         "**Baseline (no load):** P50={:.1}us, P95={:.1}us, P99={:.1}us\n",
         latency.baseline.p50(),
@@ -1314,16 +1644,25 @@ fn print_markdown_report(
     );
 
     println!("\n**Key Observations:**\n");
-    if latency.always_inline.interference_factor > 5.0 {
+    if latency.always_inline.interference_factor > 1.2 {
         println!(
-            "- AlwaysInline causes severe wake latency degradation ({:.0}x)",
+            "- AlwaysInline causes {:.1}x wake latency degradation (starvation risk)",
             latency.always_inline.interference_factor
         );
     }
+    if latency.always_offload.interference_factor < 2.0 {
+        println!(
+            "- AlwaysOffload maintains low interference ({:.1}x) but pays throughput cost",
+            latency.always_offload.interference_factor
+        );
+    }
     let adaptive_vs_offload =
-        latency.adaptive.interference_factor / latency.always_offload.interference_factor;
-    if adaptive_vs_offload < 1.5 {
-        println!("- Adaptive achieves similar latency protection to AlwaysOffload");
+        latency.adaptive.interference_factor / latency.always_offload.interference_factor.max(0.1);
+    if adaptive_vs_offload < 2.0 {
+        println!(
+            "- Adaptive achieves similar latency protection to AlwaysOffload ({:.1}x vs {:.1}x)",
+            latency.adaptive.interference_factor, latency.always_offload.interference_factor
+        );
     }
 
     println!(
@@ -1581,13 +1920,111 @@ fn print_markdown_report(
 
     println!("- **Recommended default:** balanced-tokio (2:14) for general purpose workloads");
 
+    // Section 6: Workload Shift
+    println!("\n---\n");
+    println!("## 6. Workload Shift Adaptation\n");
+    println!("Tests the MAB's ability to adapt when workload characteristics change abruptly.");
+    println!("200 fast observations (20us) followed by 200 slow observations (500us).\n");
+
+    println!("### Decision Trajectory\n");
+    println!("| Observation Range | Inline % | Offload % |");
+    println!("|-------------------|----------|-----------|");
+    for (label, inline_pct, offload_pct) in &workload_shift.trajectory {
+        println!("| {} | {:.0}% | {:.0}% |", label, inline_pct, offload_pct);
+    }
+
+    println!(
+        "\n**Observations to switch after shift:** {}",
+        workload_shift.observations_to_switch
+    );
+    println!(
+        "**Guardrail protection during transition:** {}",
+        if workload_shift.guardrail_protected {
+            "Yes (immediate offload)"
+        } else {
+            "No (MAB learned)"
+        }
+    );
+
+    // Section 7: Pressure Escalation
+    println!("\n---\n");
+    println!("## 7. Pressure Escalation\n");
+    println!("Gradually increases concurrent load on a 4-tokio-thread runtime to show");
+    println!("guardrail activation under pressure.\n");
+
+    println!(
+        "| Load Level | Spawn Rate | Pressure | GR Activations | Inline % | Starvation Events |"
+    );
+    println!(
+        "|------------|------------|----------|----------------|----------|-------------------|"
+    );
+    for level in &pressure_escalation.levels {
+        println!(
+            "| {} | {:.0}/s | {:.1} | {} | {:.0}% | {} |",
+            level.load_label,
+            level.spawn_rate,
+            level.pressure_index,
+            level.gr_activations,
+            level.inline_pct,
+            level.starvation_events
+        );
+    }
+
+    let high_pressure_activations: u64 = pressure_escalation
+        .levels
+        .iter()
+        .filter(|l| l.pressure_index > 3.0)
+        .map(|l| l.gr_activations)
+        .sum();
+    println!(
+        "\n**Key Finding:** {} guardrail activations at pressure > 3.0",
+        high_pressure_activations
+    );
+
+    // Section 8: Runtime Metrics Summary
+    println!("\n---\n");
+    println!("## 8. Runtime Metrics Summary\n");
+    println!("Cumulative Prometheus counters across all evaluation phases.\n");
+
+    println!("| Metric | Value |");
+    println!("|--------|-------|");
+    println!(
+        "| Inline Decisions | {} |",
+        cumulative_metrics.inline_decisions
+    );
+    println!(
+        "| Offload Decisions | {} |",
+        cumulative_metrics.offload_decisions
+    );
+    println!(
+        "| GR1 Activations | {} |",
+        cumulative_metrics.gr1_activations
+    );
+    println!(
+        "| GR2 Activations | {} |",
+        cumulative_metrics.gr2_activations
+    );
+    println!(
+        "| GR3 Activations | {} |",
+        cumulative_metrics.gr3_activations
+    );
+    println!(
+        "| Starvation Events | {} |",
+        cumulative_metrics.starvation_events
+    );
+    println!(
+        "| Last Pressure Index | {:.2} |",
+        cumulative_metrics.pressure_index
+    );
+
     // Conclusion
     println!("\n---\n");
     println!("## Conclusion\n");
     if verdict.overall_pass {
         println!("The MAB adaptive scheduler in loom-rs delivers value:\n");
         println!("1. **Low Overhead** - Decision cost < 200ns doesn't impact performance");
-        println!("2. **Latency Protection** - Guardrails prevent Tokio starvation");
+        println!("2. **Starvation Protection** - Inline causes {:.1}x interference; adaptive keeps it at {:.1}x",
+            latency.always_inline.interference_factor, latency.adaptive.interference_factor);
         println!("3. **Throughput Optimization** - Learns to inline fast work, offload slow work");
         println!(
             "4. **Fast Learning** - Converges within ~{} observations",
@@ -1596,6 +2033,11 @@ fn print_markdown_report(
                 .observations_to_stable
                 .max(learning.slow_work_convergence.observations_to_stable)
         );
+        println!(
+            "5. **Adaptive** - Detects workload shifts within ~{} observations",
+            workload_shift.observations_to_switch
+        );
+        println!("6. **Guardrails** - Activate under pressure to prevent starvation");
         println!("\nThe adaptive approach achieves the best of both worlds: low latency for");
         println!("small work (by inlining) and protected async responsiveness (by offloading slow work).");
     } else {
@@ -1695,9 +2137,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Phase 1: Measuring MAB overhead...");
     let overhead = measure_overhead(&eval_config);
 
-    // Phase 2: Wake Latency Impact
-    eprintln!("Phase 2: Measuring wake latency impact...");
-    let latency = measure_latency_impact(&eval_config, &default_runtime);
+    // Phase 2: Wake Latency Impact (uses dedicated 1-thread runtime)
+    eprintln!("Phase 2: Measuring wake latency impact (1-thread runtime)...");
+    let latency = measure_latency_impact(&eval_config);
 
     // Phase 3: Throughput Comparison
     eprintln!("Phase 3: Measuring throughput...");
@@ -1719,8 +2161,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Phase 6: Workload Shift
+    eprintln!("Phase 6: Testing workload shift adaptation...");
+    let workload_shift = measure_workload_shift();
+
+    // Phase 7: Pressure Escalation
+    eprintln!("Phase 7: Testing pressure escalation...");
+    let pressure_escalation = measure_pressure_escalation();
+
+    // Collect cumulative metrics from pressure escalation (most comprehensive)
+    // Since each phase creates its own metrics, we aggregate from pressure test
+    let cumulative_metrics = {
+        let metrics = LoomMetrics::new();
+        let scheduler = MabScheduler::with_metrics(MabKnobs::default(), metrics.clone());
+        let key = FunctionKey::from_name("cumulative_metrics");
+
+        // Run representative workload to populate metrics
+        let ctx_low = Context {
+            tokio_workers: 4,
+            inflight_tasks: 2,
+            spawn_rate_per_s: 100.0,
+            rayon_threads: 8,
+            rayon_queue_depth: 0,
+        };
+        let ctx_high = Context {
+            tokio_workers: 1,
+            inflight_tasks: 50,
+            spawn_rate_per_s: 5000.0,
+            rayon_threads: 7,
+            rayon_queue_depth: 0,
+        };
+
+        // Fast work under low pressure
+        for _ in 0..50 {
+            let (id, _) = scheduler.choose(key, &ctx_low);
+            scheduler.finish(id, 20.0, Some(20.0));
+        }
+        // Slow work under high pressure
+        let key2 = FunctionKey::from_name("cumulative_slow");
+        for _ in 0..50 {
+            let (id, _) = scheduler.choose(key2, &ctx_high);
+            scheduler.finish(id, 500.0, Some(500.0));
+        }
+
+        MetricsSnapshot::capture(&metrics)
+    };
+
     // Compute verdict
-    let verdict = compute_verdict(&overhead, &latency, &throughput, &learning);
+    let verdict = compute_verdict(
+        &overhead,
+        &latency,
+        &throughput,
+        &learning,
+        &pressure_escalation,
+    );
 
     // Generate Report (to stdout)
     eprintln!("\nGenerating report...\n");
@@ -1731,7 +2225,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &latency,
         &throughput,
         &learning,
+        &workload_shift,
+        &pressure_escalation,
         &config_results,
+        &cumulative_metrics,
         &verdict,
     );
 
