@@ -20,6 +20,7 @@ use crate::metrics::LoomMetrics;
 struct Pending {
     key: FunctionKey,
     arm: Arm,
+    hint: ComputeHint,
 }
 
 /// Internal mutable state of the scheduler.
@@ -158,17 +159,24 @@ impl MabScheduler {
         // Check if we should force offload exploration for High hint
         if ks.hint_explore_remaining > 0 {
             ks.hint_explore_remaining -= 1;
-            let id = self.allocate_decision_inner(&mut inner, key, Arm::OffloadRayon);
+            let id = self.allocate_decision_inner(&mut inner, key, Arm::OffloadRayon, hint);
             return (id, Arm::OffloadRayon);
         }
 
         // Collect stats for Thompson sampling before we need to borrow rng
         let inline_stats = ks.inline;
         let offload_stats = ks.offload;
-        let ema_fn_us = ks.ema_fn_us;
         let inline_n_eff = ks.inline.n_eff;
         let offload_n_eff = ks.offload.n_eff;
         let inline_strikes = ks.inline_strikes;
+
+        // Use hint-specific EMA if we have enough samples, otherwise fall back to global
+        let hint_idx = hint.index();
+        let ema_fn_us = if ks.hint_n_eff[hint_idx] >= self.knobs.hint_min_samples {
+            ks.hint_ema[hint_idx]
+        } else {
+            ks.ema_fn_us
+        };
 
         // Apply guardrails (using local copies)
         let (inline_allowed, guardrail_triggered) =
@@ -194,7 +202,7 @@ impl MabScheduler {
             }
         }
 
-        let id = self.allocate_decision_inner(&mut inner, key, arm);
+        let id = self.allocate_decision_inner(&mut inner, key, arm, hint);
         (id, arm)
     }
 
@@ -227,6 +235,23 @@ impl MabScheduler {
             ks.ema_fn_us =
                 self.knobs.ema_alpha * fn_us + (1.0 - self.knobs.ema_alpha) * ks.ema_fn_us;
         }
+
+        // Update per-hint EMA with cold-start seeding
+        let hint_idx = pending.hint.index();
+        if ks.hint_n_eff[hint_idx] == 0.0 {
+            // Cold-start seeding: blend hint prior with first observation
+            let prior = self.hint_to_ema(pending.hint);
+            if prior > 0.0 {
+                // Weight observation and prior equally on first sample
+                ks.hint_ema[hint_idx] = (fn_us + prior) / 2.0;
+            } else {
+                ks.hint_ema[hint_idx] = fn_us;
+            }
+        } else {
+            ks.hint_ema[hint_idx] =
+                self.knobs.ema_alpha * fn_us + (1.0 - self.knobs.ema_alpha) * ks.hint_ema[hint_idx];
+        }
+        ks.hint_n_eff[hint_idx] += 1.0;
 
         // Update arm statistics using log-cost model
         let log_cost = observed_cost_us.max(1.0).ln();
@@ -328,11 +353,12 @@ impl MabScheduler {
         inner: &mut MabInner,
         key: FunctionKey,
         arm: Arm,
+        hint: ComputeHint,
     ) -> DecisionId {
         let id = DecisionId(inner.next_id);
         inner.next_id += 1;
 
-        inner.pending.insert(id, Pending { key, arm });
+        inner.pending.insert(id, Pending { key, arm, hint });
 
         id
     }
@@ -992,5 +1018,218 @@ mod tests {
         let (allowed, guardrail) = scheduler.inline_allowed_with_guardrail(30.0, 0.0, &ctx, 0.5);
         assert!(allowed);
         assert_eq!(guardrail, None);
+    }
+
+    // =============================================================================
+    // Per-Hint EMA Tracking Tests
+    // =============================================================================
+
+    #[test]
+    fn test_per_hint_ema_tracking() {
+        // Verify that different hints accumulate separate EMAs
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("hint_test");
+        let ctx = default_ctx();
+
+        // Train Low hints with fast execution (10µs)
+        for _ in 0..10 {
+            let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::Low);
+            scheduler.finish(id, 10.0, Some(10.0));
+        }
+
+        // Train High hints with slow execution (500µs)
+        for _ in 0..10 {
+            let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::High);
+            scheduler.finish(id, 500.0, Some(500.0));
+        }
+
+        // Verify separate EMAs
+        let inner = scheduler.inner.lock();
+        let ks = inner.per_key.get(&key).unwrap();
+
+        assert!(
+            ks.hint_ema[ComputeHint::Low.index()] < 50.0,
+            "Low hint EMA should be ~10µs, got {}",
+            ks.hint_ema[ComputeHint::Low.index()]
+        );
+        assert!(
+            ks.hint_ema[ComputeHint::High.index()] > 400.0,
+            "High hint EMA should be ~500µs, got {}",
+            ks.hint_ema[ComputeHint::High.index()]
+        );
+    }
+
+    #[test]
+    fn test_hint_influences_arm_selection() {
+        // After learning, Low hints should inline, High hints should offload
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("selection_test");
+        let ctx = default_ctx();
+
+        // Train the scheduler
+        for _ in 0..20 {
+            let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::Low);
+            scheduler.finish(id, 10.0, Some(10.0)); // Fast
+
+            let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::High);
+            scheduler.finish(id, 500.0, Some(500.0)); // Slow
+        }
+
+        // Now test: Low hints should prefer inline
+        let mut low_inline = 0;
+        for _ in 0..20 {
+            let (id, arm) = scheduler.choose_with_hint(key, &ctx, ComputeHint::Low);
+            if arm == Arm::InlineTokio {
+                low_inline += 1;
+            }
+            scheduler.finish(id, 10.0, Some(10.0));
+        }
+
+        // High hints should prefer offload (due to GR1: ema > 250µs)
+        let mut high_offload = 0;
+        for _ in 0..20 {
+            let (id, arm) = scheduler.choose_with_hint(key, &ctx, ComputeHint::High);
+            if arm == Arm::OffloadRayon {
+                high_offload += 1;
+            }
+            scheduler.finish(id, 500.0, Some(500.0));
+        }
+
+        assert!(
+            low_inline >= 15,
+            "Low hints should mostly inline, got {}/20",
+            low_inline
+        );
+        assert!(
+            high_offload >= 18,
+            "High hints should mostly offload, got {}/20",
+            high_offload
+        );
+    }
+
+    #[test]
+    fn test_hint_fallback_to_global_ema() {
+        // Before hint_min_samples, should use global EMA
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("fallback_test");
+        let ctx = default_ctx();
+
+        // Train global EMA with Unknown hints
+        for _ in 0..10 {
+            let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::Unknown);
+            scheduler.finish(id, 100.0, Some(100.0));
+        }
+
+        // First Low hint should use global EMA (no Low samples yet)
+        // We can't directly test internal state, but we can verify
+        // the scheduler doesn't crash and makes reasonable decisions
+        let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::Low);
+        scheduler.finish(id, 10.0, Some(10.0));
+
+        // Verify Low hint_n_eff is now 1
+        let inner = scheduler.inner.lock();
+        let ks = inner.per_key.get(&key).unwrap();
+        assert!(
+            (ks.hint_n_eff[ComputeHint::Low.index()] - 1.0).abs() < 0.01,
+            "Low hint should have 1 sample"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_seeding() {
+        // First observation should blend prior with actual
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("seeding_test");
+        let ctx = default_ctx();
+
+        // First High hint observation
+        let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::High);
+        scheduler.finish(id, 100.0, Some(100.0)); // Actual: 100µs, prior: ~1000µs
+
+        let inner = scheduler.inner.lock();
+        let ks = inner.per_key.get(&key).unwrap();
+        let high_ema = ks.hint_ema[ComputeHint::High.index()];
+
+        // Should be blend of prior (~1000) and observation (100)
+        // Formula: (fn_us + prior) / 2 = (100 + 1000) / 2 = 550
+        assert!(
+            high_ema > 100.0 && high_ema < 1000.0,
+            "Cold-start should blend prior with observation, got {}",
+            high_ema
+        );
+    }
+
+    #[test]
+    fn test_inaccurate_hints_naturally_corrected() {
+        // If hints are wrong, learned EMA should override
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("correction_test");
+        let ctx = default_ctx();
+
+        // "High" hints but actually fast execution
+        for _ in 0..30 {
+            let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::High);
+            scheduler.finish(id, 20.0, Some(20.0)); // Actually fast!
+        }
+
+        // Should learn to inline despite High hint
+        let mut inline_count = 0;
+        for _ in 0..10 {
+            let (id, arm) = scheduler.choose_with_hint(key, &ctx, ComputeHint::High);
+            if arm == Arm::InlineTokio {
+                inline_count += 1;
+            }
+            scheduler.finish(id, 20.0, Some(20.0));
+        }
+
+        assert!(
+            inline_count >= 7,
+            "Should learn to inline despite High hint when actually fast, got {}/10",
+            inline_count
+        );
+    }
+
+    #[test]
+    fn test_hint_n_eff_increments() {
+        // Verify hint_n_eff is properly incremented
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("n_eff_test");
+        let ctx = default_ctx();
+
+        for i in 1..=5 {
+            let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::Medium);
+            scheduler.finish(id, 100.0, Some(100.0));
+
+            let inner = scheduler.inner.lock();
+            let ks = inner.per_key.get(&key).unwrap();
+            assert!(
+                (ks.hint_n_eff[ComputeHint::Medium.index()] - i as f64).abs() < 0.01,
+                "hint_n_eff should be {}, got {}",
+                i,
+                ks.hint_n_eff[ComputeHint::Medium.index()]
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_hint_no_prior_blending() {
+        // Unknown hint should not blend with prior (prior is 0)
+        let scheduler = MabScheduler::with_defaults();
+        let key = FunctionKey::from_name("unknown_test");
+        let ctx = default_ctx();
+
+        let (id, _) = scheduler.choose_with_hint(key, &ctx, ComputeHint::Unknown);
+        scheduler.finish(id, 50.0, Some(50.0));
+
+        let inner = scheduler.inner.lock();
+        let ks = inner.per_key.get(&key).unwrap();
+        let unknown_ema = ks.hint_ema[ComputeHint::Unknown.index()];
+
+        // Unknown hint has prior=0, so no blending, just use observation
+        assert!(
+            (unknown_ema - 50.0).abs() < 1.0,
+            "Unknown hint EMA should be ~50µs (no prior blending), got {}",
+            unknown_ema
+        );
     }
 }

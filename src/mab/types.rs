@@ -154,6 +154,9 @@ impl ArmStats {
     }
 }
 
+/// Number of compute hint levels (Unknown, Low, Medium, High).
+pub const HINT_LEVELS: usize = 4;
+
 /// Per-function statistics tracking both arms.
 #[derive(Clone, Debug)]
 pub struct KeyStats {
@@ -167,6 +170,10 @@ pub struct KeyStats {
     pub inline_strikes: f64,
     /// Number of forced offload explorations remaining (for High hint)
     pub hint_explore_remaining: u32,
+    /// Per-hint EMA of execution time: [Unknown, Low, Medium, High]
+    pub hint_ema: [f64; HINT_LEVELS],
+    /// Per-hint effective sample count
+    pub hint_n_eff: [f64; HINT_LEVELS],
 }
 
 impl Default for KeyStats {
@@ -177,6 +184,8 @@ impl Default for KeyStats {
             ema_fn_us: 0.0,
             inline_strikes: 0.0,
             hint_explore_remaining: 0,
+            hint_ema: [0.0; HINT_LEVELS],
+            hint_n_eff: [0.0; HINT_LEVELS],
         }
     }
 }
@@ -188,6 +197,16 @@ impl KeyStats {
             ema_fn_us,
             ..Default::default()
         }
+    }
+}
+
+impl ComputeHint {
+    /// Get the array index for this hint level.
+    ///
+    /// Returns a value in `0..HINT_LEVELS` suitable for indexing hint arrays.
+    #[inline]
+    pub fn index(self) -> usize {
+        self as usize
     }
 }
 

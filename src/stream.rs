@@ -816,4 +816,50 @@ mod tests {
             assert_eq!(stream.size_hint(), (10, Some(10)));
         });
     }
+
+    #[test]
+    fn test_adaptive_map_per_hint_learning() {
+        use crate::mab::{ComputeHint, ComputeHintProvider};
+
+        struct SizedItem {
+            size: usize,
+        }
+
+        impl ComputeHintProvider for SizedItem {
+            fn compute_hint(&self) -> ComputeHint {
+                if self.size < 100 {
+                    ComputeHint::Low
+                } else {
+                    ComputeHint::High
+                }
+            }
+        }
+
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            // Mix of small (fast) and large (slow) items
+            let items: Vec<SizedItem> = (0..100)
+                .map(|i| SizedItem {
+                    size: if i % 5 == 0 { 1000 } else { 10 },
+                })
+                .collect();
+
+            let results: Vec<_> = stream::iter(items)
+                .adaptive_map(|item| {
+                    // Simulate size-dependent work
+                    let iterations = item.size * 100;
+                    let mut sum = 0u64;
+                    for i in 0..iterations {
+                        sum = sum.wrapping_add(i as u64);
+                    }
+                    sum
+                })
+                .collect()
+                .await;
+
+            assert_eq!(results.len(), 100);
+            // The test validates that per-hint learning doesn't break correctness.
+            // Behavioral verification (inline vs offload decisions) is in unit tests.
+        });
+    }
 }

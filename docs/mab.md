@@ -262,6 +262,7 @@ let runtime = LoomBuilder::new()
 |-----------|---------|-------------|
 | `hint_trust_threshold` | 5.0 | n_eff below which hints matter |
 | `hint_exploration_count` | 3 | Forced offload count for High hint |
+| `hint_min_samples` | 3.0 | Samples before trusting hint-specific EMA |
 | `hint_low_ema_us` | 30.0 | Initial EMA for Low hint |
 | `hint_medium_ema_us` | 200.0 | Initial EMA for Medium hint |
 | `hint_high_ema_us` | 1000.0 | Initial EMA for High hint |
@@ -282,7 +283,7 @@ let runtime = LoomBuilder::new()
 
 ## Compute Hints
 
-Implement `ComputeHintProvider` on input types to guide cold-start behavior:
+Implement `ComputeHintProvider` on input types to enable per-item adaptive behavior:
 
 ```rust
 use loom_rs::mab::{ComputeHint, ComputeHintProvider};
@@ -309,6 +310,59 @@ impl ComputeHintProvider for WorkItem {
 }
 ```
 
+### Per-Item Hint Adaptation
+
+The scheduler learns **separate execution time distributions** for each hint level. This enables true per-item adaptive behavior where hints guide decisions based on learned performance for that hint category:
+
+```rust
+use loom_rs::{LoomBuilder, ComputeStreamExt};
+use loom_rs::mab::{ComputeHint, ComputeHintProvider};
+use futures::stream::{self, StreamExt};
+
+/// Work item with size-based compute hint
+struct WorkItem {
+    id: u64,
+    data: Vec<u8>,
+}
+
+impl ComputeHintProvider for WorkItem {
+    fn compute_hint(&self) -> ComputeHint {
+        match self.data.len() {
+            0..=1024 => ComputeHint::Low,       // Small items: likely fast
+            1025..=65536 => ComputeHint::Medium,
+            _ => ComputeHint::High,              // Large items: likely slow
+        }
+    }
+}
+
+fn process(item: WorkItem) -> ProcessedResult {
+    // Cost scales with data size
+    expensive_computation(&item.data)
+}
+
+let runtime = LoomBuilder::new()
+    .tokio_threads(4)
+    .rayon_threads(8)
+    .build()?;
+
+runtime.block_on(async {
+    let items = generate_mixed_workload(); // Mix of small and large items
+
+    // The scheduler learns separately for each hint level:
+    // - Low hint items: learns they average ~20µs → inlines
+    // - Medium hint items: learns they average ~150µs → mixed decisions
+    // - High hint items: learns they average ~800µs → offloads
+    //
+    // After ~3 samples per hint level, decisions become hint-aware.
+    // Hints that prove inaccurate are naturally ignored as their
+    // learned EMA diverges from the hint's expectation.
+    let results: Vec<_> = stream::iter(items)
+        .adaptive_map(process)
+        .collect()
+        .await;
+});
+```
+
 ### Hint Levels
 
 | Hint | Expected Duration | Cold-Start Behavior |
@@ -318,7 +372,22 @@ impl ComputeHintProvider for WorkItem {
 | `Medium` | 50-500µs | Seeds EMA at 200µs, explores both |
 | `High` | > 500µs | Seeds EMA at 1000µs, forces 3 offloads |
 
-**Important:** Hints only affect cold-start behavior. Once the scheduler has enough observations (`n_eff > hint_trust_threshold`), it relies entirely on learned data.
+### Per-Hint Learning
+
+Each hint level maintains its own EMA (Exponential Moving Average) of execution times:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `hint_min_samples` | 3.0 | Samples needed before trusting hint-specific EMA |
+
+**How it works:**
+
+1. **Cold-start**: First observation for a hint blends the hint's prior with the actual measurement
+2. **Learning**: After `hint_min_samples` observations, decisions use the hint-specific EMA
+3. **Fallback**: Before enough samples, falls back to global `ema_fn_us`
+4. **Self-correction**: Inaccurate hints are naturally corrected as learned EMA diverges from prior
+
+**Important:** The scheduler learns per-hint behavior independently. If your "High" hints consistently execute in 20µs, the scheduler will learn to inline them despite the hint suggesting offload.
 
 ## When to Use What
 
@@ -378,14 +447,30 @@ The MAB will:
 
 ```rust
 use loom_rs::{LoomBuilder, ComputeStreamExt};
+use loom_rs::mab::{ComputeHint, ComputeHintProvider};
 use futures::stream::{self, StreamExt};
 
-// Work with variable duration
-fn variable_work(n: u64) -> u64 {
-    let iterations = if n % 10 == 0 { 50_000 } else { 100 };
+/// Work item that provides hints based on its size
+struct WorkItem {
+    id: u64,
+    size: usize,
+}
+
+impl ComputeHintProvider for WorkItem {
+    fn compute_hint(&self) -> ComputeHint {
+        match self.size {
+            0..=100 => ComputeHint::Low,      // Small items
+            101..=10000 => ComputeHint::Medium,
+            _ => ComputeHint::High,            // Large items
+        }
+    }
+}
+
+fn process_item(item: WorkItem) -> u64 {
+    // Work scales with size
     let mut sum = 0u64;
-    for i in 0..iterations {
-        sum = sum.wrapping_add(i);
+    for i in 0..item.size {
+        sum = sum.wrapping_add(i as u64);
     }
     sum
 }
@@ -396,11 +481,21 @@ let runtime = LoomBuilder::new()
     .build()?;
 
 runtime.block_on(async {
-    // MAB will learn:
-    // - Most items (n % 10 != 0) are fast → inline
-    // - Every 10th item is slow → offload
-    let results: Vec<_> = stream::iter(0..1000)
-        .adaptive_map(variable_work)
+    // Create mixed workload: mostly small items, some large
+    let items: Vec<WorkItem> = (0..1000)
+        .map(|i| WorkItem {
+            id: i,
+            size: if i % 10 == 0 { 50_000 } else { 50 },
+        })
+        .collect();
+
+    // MAB learns separately for each hint level:
+    // - Low hint items (size=50): learns they're ~5µs → inlines
+    // - High hint items (size=50000): learns they're ~500µs → offloads
+    //
+    // After ~3 samples per hint, decisions become hint-aware.
+    let results: Vec<_> = stream::iter(items)
+        .adaptive_map(process_item)
         .collect()
         .await;
 });
