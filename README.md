@@ -391,7 +391,7 @@ Configure pool size for high-concurrency workloads:
 
 ```rust
 let runtime = LoomBuilder::new()
-    .compute_pool_size(128)  // Default is 64
+    .task_state_pool_size(128)  // Default is 64
     .build()?;
 ```
 

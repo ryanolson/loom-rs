@@ -27,9 +27,9 @@ pub struct LoomConfig {
     #[serde(default)]
     pub rayon_threads: Option<usize>,
 
-    /// Size of compute task pool per result type (default: 64)
-    #[serde(default = "default_compute_pool_size")]
-    pub compute_pool_size: usize,
+    /// Size of TaskState object pool per result type (default: 64)
+    #[serde(default = "default_task_state_pool_size")]
+    pub task_state_pool_size: usize,
 
     /// Whether to pin threads to specific CPUs (default: true)
     #[serde(default = "default_pin_threads")]
@@ -57,7 +57,7 @@ pub struct LoomConfig {
     pub prometheus_registry: Option<Registry>,
 }
 
-fn default_compute_pool_size() -> usize {
+fn default_task_state_pool_size() -> usize {
     DEFAULT_POOL_SIZE
 }
 
@@ -75,7 +75,7 @@ impl Default for LoomConfig {
             prefix: default_prefix(),
             tokio_threads: None,
             rayon_threads: None,
-            compute_pool_size: default_compute_pool_size(),
+            task_state_pool_size: default_task_state_pool_size(),
             pin_threads: default_pin_threads(),
             #[cfg(feature = "cuda")]
             cuda_device: None,
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(config.prefix, "loom");
         assert!(config.tokio_threads.is_none());
         assert!(config.rayon_threads.is_none());
-        assert_eq!(config.compute_pool_size, 64);
+        assert_eq!(config.task_state_pool_size, 64);
         assert!(config.pin_threads);
         assert!(config.mab_knobs.is_none());
         assert!(config.calibration.is_none());
@@ -155,14 +155,14 @@ mod tests {
             prefix = "myapp"
             tokio_threads = 2
             rayon_threads = 6
-            compute_pool_size = 128
+            task_state_pool_size = 128
         "#;
 
         let config: LoomConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.prefix, "myapp");
         assert_eq!(config.tokio_threads, Some(2));
         assert_eq!(config.rayon_threads, Some(6));
-        assert_eq!(config.compute_pool_size, 128);
+        assert_eq!(config.task_state_pool_size, 128);
         // pin_threads should default to true when not specified
         assert!(config.pin_threads);
     }

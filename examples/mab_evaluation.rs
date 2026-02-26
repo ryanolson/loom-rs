@@ -440,6 +440,430 @@ struct StrategyLatencyResult {
     interference_factor: f64,
 }
 
+/// Results from the tokio-only baseline test (no rayon pool).
+#[derive(Debug)]
+#[allow(dead_code)]
+struct TokioOnlyResult {
+    baseline: Stats,
+    under_load: StrategyLatencyResult,
+}
+
+/// Measures latency on a pure tokio runtime with no rayon pool.
+///
+/// This shows what a normal tokio application experiences when CPU-bound
+/// work runs directly on worker threads — the "everyone's reality" baseline.
+fn measure_tokio_only_baseline(config: &EvaluationConfig) -> TokioOnlyResult {
+    let tokio_threads = 8;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tokio_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio-only runtime");
+
+    let probe_sleep = config.latency_probe_sleep;
+    let phase_duration = config.latency_phase_duration;
+    let work_us = config.latency_work_us;
+    let spawn_interval = Duration::from_micros(1_000_000 / config.latency_work_rate);
+
+    // Baseline (no load)
+    let baseline = rt.block_on(async {
+        let samples = Arc::new(Mutex::new(Stats::new()));
+        let running = Arc::new(AtomicBool::new(true));
+
+        latency_probe(
+            probe_sleep,
+            phase_duration,
+            samples.clone(),
+            running.clone(),
+        )
+        .await;
+
+        running.store(false, Ordering::Relaxed);
+        let result = std::mem::take(&mut *samples.lock());
+        result
+    });
+
+    let baseline_p95 = baseline.p95();
+
+    // Under load: spawn CPU-bound work as regular tokio tasks (the problem scenario)
+    let under_load = rt.block_on(async {
+        let samples = Arc::new(Mutex::new(Stats::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let completed = Arc::new(AtomicU64::new(0));
+
+        let probe_handle = tokio::spawn({
+            let samples = samples.clone();
+            let running = running.clone();
+            async move {
+                latency_probe(probe_sleep, phase_duration, samples, running).await;
+            }
+        });
+
+        let start = Instant::now();
+        while Instant::now() < start + phase_duration {
+            let completed_clone = completed.clone();
+            tokio::spawn(async move {
+                std::hint::black_box(spin_for(work_us));
+                completed_clone.fetch_add(1, Ordering::Relaxed);
+            });
+            tokio::time::sleep(spawn_interval).await;
+        }
+
+        running.store(false, Ordering::Relaxed);
+        let _ = probe_handle.await;
+
+        let duration = start.elapsed();
+        let latency = std::mem::take(&mut *samples.lock());
+        let completed_tasks = completed.load(Ordering::Relaxed);
+        let throughput = completed_tasks as f64 / duration.as_secs_f64();
+        let interference_factor = if baseline_p95 > 0.0 {
+            latency.p95() / baseline_p95
+        } else {
+            1.0
+        };
+
+        StrategyLatencyResult {
+            latency,
+            throughput,
+            interference_factor,
+        }
+    });
+
+    TokioOnlyResult {
+        baseline,
+        under_load,
+    }
+}
+
+/// Results from the heavy compute (tokenizer simulation) latency test.
+///
+/// Simulates `tokenizer.encode()` at 50ms per call using burst traffic patterns.
+/// Traffic arrives in bursts that temporarily oversubscribe compute capacity,
+/// with quiet periods in between for draining.
+#[derive(Debug)]
+struct TokenizerLatencyResults {
+    /// Work duration in microseconds
+    work_us: u64,
+    /// Tasks/sec during burst phases
+    burst_rate: u64,
+    /// Duration of each burst in milliseconds
+    burst_duration_ms: u64,
+    /// Quiet period between bursts in milliseconds
+    quiet_duration_ms: u64,
+    /// Number of burst cycles
+    num_bursts: u64,
+    /// TokioOnly baseline (8 threads, no rayon)
+    tokio_only: TokioOnlyResult,
+    /// Loom-rs strategies (1T+7R)
+    loom_inline: StrategyLatencyResult,
+    loom_offload: StrategyLatencyResult,
+    loom_adaptive: StrategyLatencyResult,
+}
+
+/// Measures latency impact with heavy compute work simulating tokenizer.encode().
+///
+/// Uses burst traffic patterns: 500ms bursts at 300/s separated by 500ms quiet
+/// periods. Average rate is 150/s but instantaneous rate during bursts is 300/s,
+/// oversubscribing 8 tokio threads. Over 10 cycles (10s total), compute work
+/// queues up during bursts — the key question is whether I/O tasks starve.
+fn measure_tokenizer_latency(config: &EvaluationConfig) -> TokenizerLatencyResults {
+    let work_us: u64 = 50_000; // 50ms — realistic tokenizer.encode() on large prompts
+    let burst_rate: u64 = 300; // tasks/s during bursts
+    let burst_duration = Duration::from_millis(500);
+    let quiet_duration = Duration::from_millis(500);
+    let num_bursts: u64 = 10; // 10 cycles × 1s = 10s total
+    let burst_interval = Duration::from_micros(1_000_000 / burst_rate);
+    let phase_duration = Duration::from_millis(num_bursts * (500 + 500));
+    let probe_sleep = config.latency_probe_sleep;
+
+    // --- TokioOnly (8 threads, no rayon) ---
+    let tokio_only = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("failed to build tokio-only runtime for tokenizer test");
+
+        let baseline = rt.block_on(async {
+            let samples = Arc::new(Mutex::new(Stats::new()));
+            let running = Arc::new(AtomicBool::new(true));
+            latency_probe(
+                probe_sleep,
+                phase_duration,
+                samples.clone(),
+                running.clone(),
+            )
+            .await;
+            running.store(false, Ordering::Relaxed);
+            let result = std::mem::take(&mut *samples.lock());
+            result
+        });
+
+        let baseline_p95 = baseline.p95();
+
+        let under_load = rt.block_on(async {
+            let samples = Arc::new(Mutex::new(Stats::new()));
+            let running = Arc::new(AtomicBool::new(true));
+            let completed = Arc::new(AtomicU64::new(0));
+
+            let probe_handle = tokio::spawn({
+                let samples = samples.clone();
+                let running = running.clone();
+                async move {
+                    latency_probe(probe_sleep, phase_duration, samples, running).await;
+                }
+            });
+
+            let start = Instant::now();
+            for _ in 0..num_bursts {
+                if Instant::now() >= start + phase_duration {
+                    break;
+                }
+                // Burst phase
+                let burst_end = Instant::now() + burst_duration;
+                while Instant::now() < burst_end && Instant::now() < start + phase_duration {
+                    let completed_clone = completed.clone();
+                    tokio::spawn(async move {
+                        std::hint::black_box(spin_for(work_us));
+                        completed_clone.fetch_add(1, Ordering::Relaxed);
+                    });
+                    tokio::time::sleep(burst_interval).await;
+                }
+                // Quiet phase — no new tasks, let queue drain
+                if Instant::now() < start + phase_duration {
+                    tokio::time::sleep(quiet_duration).await;
+                }
+            }
+
+            running.store(false, Ordering::Relaxed);
+            let _ = probe_handle.await;
+
+            let duration = start.elapsed();
+            let latency = std::mem::take(&mut *samples.lock());
+            let completed_tasks = completed.load(Ordering::Relaxed);
+            let throughput = completed_tasks as f64 / duration.as_secs_f64();
+            let interference_factor = if baseline_p95 > 0.0 {
+                latency.p95() / baseline_p95
+            } else {
+                1.0
+            };
+
+            StrategyLatencyResult {
+                latency,
+                throughput,
+                interference_factor,
+            }
+        });
+
+        TokioOnlyResult {
+            baseline,
+            under_load,
+        }
+    };
+
+    // --- Loom-rs (1T+7R) strategies ---
+    let runtime = LoomBuilder::new()
+        .prefix("mab-tok")
+        .tokio_threads(1)
+        .rayon_threads(7)
+        .build()
+        .expect("failed to build loom runtime for tokenizer test");
+
+    let loom_baseline_p95 = runtime.block_on(async {
+        let samples = Arc::new(Mutex::new(Stats::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        latency_probe(
+            probe_sleep,
+            phase_duration,
+            samples.clone(),
+            running.clone(),
+        )
+        .await;
+        running.store(false, Ordering::Relaxed);
+        let result = std::mem::take(&mut *samples.lock());
+        result.p95()
+    });
+
+    // AlwaysInline — 50ms blocks on single tokio thread
+    let loom_inline = runtime.block_on(async {
+        let samples = Arc::new(Mutex::new(Stats::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let completed = Arc::new(AtomicU64::new(0));
+
+        let probe_handle = runtime.spawn_async({
+            let samples = samples.clone();
+            let running = running.clone();
+            async move {
+                latency_probe(probe_sleep, phase_duration, samples, running).await;
+            }
+        });
+
+        let start = Instant::now();
+        for _ in 0..num_bursts {
+            if Instant::now() >= start + phase_duration {
+                break;
+            }
+            // Burst phase
+            let burst_end = Instant::now() + burst_duration;
+            while Instant::now() < burst_end && Instant::now() < start + phase_duration {
+                let completed_clone = completed.clone();
+                runtime.spawn_async(async move {
+                    std::hint::black_box(spin_for(work_us));
+                    completed_clone.fetch_add(1, Ordering::Relaxed);
+                });
+                tokio::time::sleep(burst_interval).await;
+            }
+            // Quiet phase — no new tasks, let queue drain
+            if Instant::now() < start + phase_duration {
+                tokio::time::sleep(quiet_duration).await;
+            }
+        }
+
+        running.store(false, Ordering::Relaxed);
+        let _ = probe_handle.await;
+
+        let duration = start.elapsed();
+        let latency = std::mem::take(&mut *samples.lock());
+        let completed_tasks = completed.load(Ordering::Relaxed);
+        let throughput = completed_tasks as f64 / duration.as_secs_f64();
+        let interference_factor = if loom_baseline_p95 > 0.0 {
+            latency.p95() / loom_baseline_p95
+        } else {
+            1.0
+        };
+
+        StrategyLatencyResult {
+            latency,
+            throughput,
+            interference_factor,
+        }
+    });
+
+    // AlwaysOffload — 50ms work goes to rayon, tokio stays free
+    let loom_offload = runtime.block_on(async {
+        let samples = Arc::new(Mutex::new(Stats::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let completed = Arc::new(AtomicU64::new(0));
+
+        let probe_handle = runtime.spawn_async({
+            let samples = samples.clone();
+            let running = running.clone();
+            async move {
+                latency_probe(probe_sleep, phase_duration, samples, running).await;
+            }
+        });
+
+        let start = Instant::now();
+        for _ in 0..num_bursts {
+            if Instant::now() >= start + phase_duration {
+                break;
+            }
+            // Burst phase
+            let burst_end = Instant::now() + burst_duration;
+            while Instant::now() < burst_end && Instant::now() < start + phase_duration {
+                let completed_clone = completed.clone();
+                runtime.spawn_async(async move {
+                    loom_rs::spawn_compute(move || spin_for(work_us)).await;
+                    completed_clone.fetch_add(1, Ordering::Relaxed);
+                });
+                tokio::time::sleep(burst_interval).await;
+            }
+            // Quiet phase — no new tasks, let queue drain
+            if Instant::now() < start + phase_duration {
+                tokio::time::sleep(quiet_duration).await;
+            }
+        }
+
+        running.store(false, Ordering::Relaxed);
+        let _ = probe_handle.await;
+
+        let duration = start.elapsed();
+        let latency = std::mem::take(&mut *samples.lock());
+        let completed_tasks = completed.load(Ordering::Relaxed);
+        let throughput = completed_tasks as f64 / duration.as_secs_f64();
+        let interference_factor = if loom_baseline_p95 > 0.0 {
+            latency.p95() / loom_baseline_p95
+        } else {
+            1.0
+        };
+
+        StrategyLatencyResult {
+            latency,
+            throughput,
+            interference_factor,
+        }
+    });
+
+    // Adaptive — MAB should immediately learn to offload 50ms work
+    let loom_adaptive = runtime.block_on(async {
+        let samples = Arc::new(Mutex::new(Stats::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let completed = Arc::new(AtomicU64::new(0));
+
+        let probe_handle = runtime.spawn_async({
+            let samples = samples.clone();
+            let running = running.clone();
+            async move {
+                latency_probe(probe_sleep, phase_duration, samples, running).await;
+            }
+        });
+
+        let start = Instant::now();
+        for _ in 0..num_bursts {
+            if Instant::now() >= start + phase_duration {
+                break;
+            }
+            // Burst phase
+            let burst_end = Instant::now() + burst_duration;
+            while Instant::now() < burst_end && Instant::now() < start + phase_duration {
+                let completed_clone = completed.clone();
+                runtime.spawn_async(async move {
+                    loom_rs::spawn_adaptive(move || spin_for(work_us)).await;
+                    completed_clone.fetch_add(1, Ordering::Relaxed);
+                });
+                tokio::time::sleep(burst_interval).await;
+            }
+            // Quiet phase — no new tasks, let queue drain
+            if Instant::now() < start + phase_duration {
+                tokio::time::sleep(quiet_duration).await;
+            }
+        }
+
+        running.store(false, Ordering::Relaxed);
+        let _ = probe_handle.await;
+
+        let duration = start.elapsed();
+        let latency = std::mem::take(&mut *samples.lock());
+        let completed_tasks = completed.load(Ordering::Relaxed);
+        let throughput = completed_tasks as f64 / duration.as_secs_f64();
+        let interference_factor = if loom_baseline_p95 > 0.0 {
+            latency.p95() / loom_baseline_p95
+        } else {
+            1.0
+        };
+
+        StrategyLatencyResult {
+            latency,
+            throughput,
+            interference_factor,
+        }
+    });
+
+    runtime.block_until_idle();
+
+    TokenizerLatencyResults {
+        work_us,
+        burst_rate,
+        burst_duration_ms: burst_duration.as_millis() as u64,
+        quiet_duration_ms: quiet_duration.as_millis() as u64,
+        num_bursts,
+        tokio_only,
+        loom_inline,
+        loom_offload,
+        loom_adaptive,
+    }
+}
+
 async fn latency_probe(
     expected_sleep: Duration,
     duration: Duration,
@@ -1055,9 +1479,13 @@ fn measure_config(
         }
     };
 
-    // Extract actual CPU assignments
-    let tokio_cpus = format_cpuset(runtime.tokio_cpus());
-    let rayon_cpus = format_cpuset(runtime.rayon_cpus());
+    // Extract actual CPU assignments, truncated to match thread count.
+    // The runtime allocates all remaining CPUs to each pool, but only
+    // `thread_config.*_threads` are actually used.
+    let tokio_cpu_count = thread_config.tokio_threads.min(runtime.tokio_cpus().len());
+    let rayon_cpu_count = thread_config.rayon_threads.min(runtime.rayon_cpus().len());
+    let tokio_cpus = format_cpuset(&runtime.tokio_cpus()[..tokio_cpu_count]);
+    let rayon_cpus = format_cpuset(&runtime.rayon_cpus()[..rayon_cpu_count]);
 
     eprintln!(
         "  Testing {} (tokio:{}, rayon:{})...",
@@ -1453,7 +1881,9 @@ fn print_markdown_report(
     system_info: &SystemInfo,
     eval_config: &EvaluationConfig,
     overhead: &OverheadResults,
+    tokio_only: &TokioOnlyResult,
     latency: &LatencyResults,
+    tokenizer: &TokenizerLatencyResults,
     throughput: &ThroughputResults,
     learning: &LearningResults,
     workload_shift: &WorkloadShiftResults,
@@ -1479,11 +1909,12 @@ fn print_markdown_report(
     println!("*optimizing throughput for mixed workloads?*\n");
     println!("1. **Overhead** - Can we afford to make a decision on every task?");
     println!("2. **Latency Impact** - Does inlining cause measurable starvation?");
-    println!("3. **Throughput** - Do we leave performance on the table?");
-    println!("4. **Learning** - Does the MAB converge to correct decisions?");
-    println!("5. **Thread Configurations** - How do different ratios affect behavior?");
-    println!("6. **Workload Shift** - Does the MAB adapt when workloads change?");
-    println!("7. **Pressure Escalation** - Do guardrails activate under load?");
+    println!("3. **Tokenizer Simulation** - What happens with real-world 50ms compute?");
+    println!("4. **Throughput** - Do we leave performance on the table?");
+    println!("5. **Learning** - Does the MAB converge to correct decisions?");
+    println!("6. **Thread Configurations** - How do different ratios affect behavior?");
+    println!("7. **Workload Shift** - Does the MAB adapt when workloads change?");
+    println!("8. **Pressure Escalation** - Do guardrails activate under load?");
     println!();
 
     // System Configuration Section
@@ -1606,10 +2037,10 @@ fn print_markdown_report(
     println!("## 2. Wake Latency Impact\n");
     println!("Measures how different strategies affect Tokio's async executor responsiveness.");
     println!(
-        "Uses a dedicated **1-tokio-thread** runtime with **{}us work** at **{}/s** rate",
+        "Uses **{}us work** at **{}/s** rate. The loom-rs tests use a **1-tokio + 7-rayon** runtime;",
         eval_config.latency_work_us, eval_config.latency_work_rate
     );
-    println!("to ensure blocking work directly competes with the latency probe.\n");
+    println!("the TokioOnly baseline uses a standard **8-thread tokio** runtime (no rayon).\n");
     println!(
         "**Baseline (no load):** P50={:.1}us, P95={:.1}us, P99={:.1}us\n",
         latency.baseline.p50(),
@@ -1619,7 +2050,15 @@ fn print_markdown_report(
     println!("| Strategy | P50 | P95 | P99 | Interference | Throughput |");
     println!("|----------|-----|-----|-----|--------------|------------|");
     println!(
-        "| AlwaysInline | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        "| TokioOnly (8T) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        tokio_only.under_load.latency.p50(),
+        tokio_only.under_load.latency.p95(),
+        tokio_only.under_load.latency.p99(),
+        tokio_only.under_load.interference_factor,
+        tokio_only.under_load.throughput
+    );
+    println!(
+        "| AlwaysInline (1T+7R) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
         latency.always_inline.latency.p50(),
         latency.always_inline.latency.p95(),
         latency.always_inline.latency.p99(),
@@ -1627,7 +2066,7 @@ fn print_markdown_report(
         latency.always_inline.throughput
     );
     println!(
-        "| AlwaysOffload | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        "| AlwaysOffload (1T+7R) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
         latency.always_offload.latency.p50(),
         latency.always_offload.latency.p95(),
         latency.always_offload.latency.p99(),
@@ -1635,7 +2074,7 @@ fn print_markdown_report(
         latency.always_offload.throughput
     );
     println!(
-        "| Adaptive (MAB) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        "| Adaptive MAB (1T+7R) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
         latency.adaptive.latency.p50(),
         latency.adaptive.latency.p95(),
         latency.adaptive.latency.p99(),
@@ -1644,6 +2083,10 @@ fn print_markdown_report(
     );
 
     println!("\n**Key Observations:**\n");
+    println!(
+        "- TokioOnly (no rayon): {:.1}x interference — this is what a standard tokio app experiences",
+        tokio_only.under_load.interference_factor
+    );
     if latency.always_inline.interference_factor > 1.2 {
         println!(
             "- AlwaysInline causes {:.1}x wake latency degradation (starvation risk)",
@@ -1675,9 +2118,83 @@ fn print_markdown_report(
         }
     );
 
-    // Section 3: Throughput Analysis
+    // Section 3: Tokenizer Simulation (Heavy Compute)
     println!("---\n");
-    println!("## 3. Throughput Analysis\n");
+    println!("## 3. Tokenizer Simulation (Heavy Compute)\n");
+    println!(
+        "Simulates `tokenizer.encode()` — **{}ms work** in **{}ms bursts at {}/s** ({} bursts, {}ms quiet between).",
+        tokenizer.work_us / 1000,
+        tokenizer.burst_duration_ms,
+        tokenizer.burst_rate,
+        tokenizer.num_bursts,
+        tokenizer.quiet_duration_ms
+    );
+    println!("Traffic arrives in bursts — compute work queues during spikes, but I/O tasks must not starve.\n");
+    println!("| Strategy | P50 | P95 | P99 | Interference | Throughput |");
+    println!("|----------|-----|-----|-----|--------------|------------|");
+    println!(
+        "| TokioOnly (8T) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        tokenizer.tokio_only.under_load.latency.p50(),
+        tokenizer.tokio_only.under_load.latency.p95(),
+        tokenizer.tokio_only.under_load.latency.p99(),
+        tokenizer.tokio_only.under_load.interference_factor,
+        tokenizer.tokio_only.under_load.throughput
+    );
+    println!(
+        "| AlwaysInline (1T+7R) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        tokenizer.loom_inline.latency.p50(),
+        tokenizer.loom_inline.latency.p95(),
+        tokenizer.loom_inline.latency.p99(),
+        tokenizer.loom_inline.interference_factor,
+        tokenizer.loom_inline.throughput
+    );
+    println!(
+        "| AlwaysOffload (1T+7R) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        tokenizer.loom_offload.latency.p50(),
+        tokenizer.loom_offload.latency.p95(),
+        tokenizer.loom_offload.latency.p99(),
+        tokenizer.loom_offload.interference_factor,
+        tokenizer.loom_offload.throughput
+    );
+    println!(
+        "| Adaptive MAB (1T+7R) | {:.1}us | {:.1}us | {:.1}us | {:.1}x | {:.0}/s |",
+        tokenizer.loom_adaptive.latency.p50(),
+        tokenizer.loom_adaptive.latency.p95(),
+        tokenizer.loom_adaptive.latency.p99(),
+        tokenizer.loom_adaptive.interference_factor,
+        tokenizer.loom_adaptive.throughput
+    );
+
+    println!("\n**Key Observations:**\n");
+    if tokenizer.tokio_only.under_load.interference_factor > 1.5 {
+        println!(
+            "- TokioOnly (8T): {:.1}x interference — burst traffic saturates all 8 threads, starving I/O",
+            tokenizer.tokio_only.under_load.interference_factor
+        );
+    } else {
+        println!(
+            "- TokioOnly (8T): {:.1}x interference — 8 threads absorb {}ms bursts at {}/s",
+            tokenizer.tokio_only.under_load.interference_factor,
+            tokenizer.burst_duration_ms,
+            tokenizer.burst_rate
+        );
+    }
+    if tokenizer.loom_inline.interference_factor > 5.0 {
+        println!(
+            "- AlwaysInline (1T): {:.1}x interference — catastrophic with 50ms blocks on 1 thread",
+            tokenizer.loom_inline.interference_factor
+        );
+    }
+    if tokenizer.loom_adaptive.interference_factor < 2.0 {
+        println!(
+            "- Adaptive MAB: {:.1}x interference — I/O stays responsive even during compute bursts",
+            tokenizer.loom_adaptive.interference_factor
+        );
+    }
+
+    // Section 4: Throughput Analysis
+    println!("\n---\n");
+    println!("## 4. Throughput Analysis\n");
     println!("Compares `adaptive_map()` vs `compute_map()` (always offload) performance.\n");
     println!("| Workload | compute_map | adaptive_map | Speedup |");
     println!("|----------|-------------|--------------|---------|");
@@ -1729,9 +2246,9 @@ fn print_markdown_report(
         }
     );
 
-    // Section 4: Learning Behavior
+    // Section 5: Learning Behavior
     println!("---\n");
-    println!("## 4. Learning Behavior\n");
+    println!("## 5. Learning Behavior\n");
     println!("Measures how quickly the MAB converges to correct decisions.\n");
     println!("### Convergence Speed\n");
     println!("| Work Type | Observations to Stable | Final Decision | Correct? |");
@@ -1810,9 +2327,9 @@ fn print_markdown_report(
         }
     );
 
-    // Section 5: Thread Configuration Analysis
+    // Section 6: Thread Configuration Analysis
     println!("---\n");
-    println!("## 5. Thread Configuration Analysis\n");
+    println!("## 6. Thread Configuration Analysis\n");
     println!("Compares different tokio:rayon thread ratios to find optimal configurations.\n");
 
     println!("### Throughput by Configuration (Mixed Workload)\n");
@@ -1920,9 +2437,9 @@ fn print_markdown_report(
 
     println!("- **Recommended default:** balanced-tokio (2:14) for general purpose workloads");
 
-    // Section 6: Workload Shift
+    // Section 7: Workload Shift
     println!("\n---\n");
-    println!("## 6. Workload Shift Adaptation\n");
+    println!("## 7. Workload Shift Adaptation\n");
     println!("Tests the MAB's ability to adapt when workload characteristics change abruptly.");
     println!("200 fast observations (20us) followed by 200 slow observations (500us).\n");
 
@@ -1946,9 +2463,9 @@ fn print_markdown_report(
         }
     );
 
-    // Section 7: Pressure Escalation
+    // Section 8: Pressure Escalation
     println!("\n---\n");
-    println!("## 7. Pressure Escalation\n");
+    println!("## 8. Pressure Escalation\n");
     println!("Gradually increases concurrent load on a 4-tokio-thread runtime to show");
     println!("guardrail activation under pressure.\n");
 
@@ -1981,9 +2498,9 @@ fn print_markdown_report(
         high_pressure_activations
     );
 
-    // Section 8: Runtime Metrics Summary
+    // Section 9: Runtime Metrics Summary
     println!("\n---\n");
-    println!("## 8. Runtime Metrics Summary\n");
+    println!("## 9. Runtime Metrics Summary\n");
     println!("Cumulative Prometheus counters across all evaluation phases.\n");
 
     println!("| Metric | Value |");
@@ -2137,23 +2654,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Phase 1: Measuring MAB overhead...");
     let overhead = measure_overhead(&eval_config);
 
-    // Phase 2: Wake Latency Impact (uses dedicated 1-thread runtime)
-    eprintln!("Phase 2: Measuring wake latency impact (1-thread runtime)...");
+    // Phase 2a: Tokio-only baseline (no rayon pool)
+    eprintln!("Phase 2a: Measuring tokio-only baseline (8-thread tokio, no rayon)...");
+    let tokio_only = measure_tokio_only_baseline(&eval_config);
+
+    // Phase 2b: Wake Latency Impact (uses dedicated 1-thread runtime)
+    eprintln!("Phase 2b: Measuring wake latency impact (1T+7R runtime)...");
     let latency = measure_latency_impact(&eval_config);
 
-    // Phase 3: Throughput Comparison
-    eprintln!("Phase 3: Measuring throughput...");
+    // Phase 3: Tokenizer Simulation (50ms work, burst traffic @ 300/s)
+    eprintln!("Phase 3: Measuring tokenizer simulation (50ms, 10 bursts @ 300/s)...");
+    let tokenizer = measure_tokenizer_latency(&eval_config);
+
+    // Phase 4: Throughput Comparison
+    eprintln!("Phase 4: Measuring throughput...");
     let throughput = measure_throughput(&eval_config, &default_runtime);
 
-    // Phase 4: Learning Behavior
-    eprintln!("Phase 4: Measuring learning behavior...");
+    // Phase 5: Learning Behavior
+    eprintln!("Phase 5: Measuring learning behavior...");
     let learning = measure_learning(&eval_config);
 
     // Cleanup default runtime
     default_runtime.block_until_idle();
 
-    // Phase 5: Thread Configuration Comparison
-    eprintln!("Phase 5: Testing thread configurations...");
+    // Phase 6: Thread Configuration Comparison
+    eprintln!("Phase 6: Testing thread configurations...");
     let mut config_results = Vec::new();
     for thread_config in &eval_config.thread_configs {
         if let Some(result) = measure_config(&eval_config, thread_config) {
@@ -2161,12 +2686,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Phase 6: Workload Shift
-    eprintln!("Phase 6: Testing workload shift adaptation...");
+    // Phase 7: Workload Shift
+    eprintln!("Phase 7: Testing workload shift adaptation...");
     let workload_shift = measure_workload_shift();
 
-    // Phase 7: Pressure Escalation
-    eprintln!("Phase 7: Testing pressure escalation...");
+    // Phase 8: Pressure Escalation
+    eprintln!("Phase 8: Testing pressure escalation...");
     let pressure_escalation = measure_pressure_escalation();
 
     // Collect cumulative metrics from pressure escalation (most comprehensive)
@@ -2222,7 +2747,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &system_info,
         &eval_config,
         &overhead,
+        &tokio_only,
         &latency,
+        &tokenizer,
         &throughput,
         &learning,
         &workload_shift,

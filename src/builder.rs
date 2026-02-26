@@ -170,7 +170,7 @@ impl LoomBuilder {
         self
     }
 
-    /// Set the compute pool size per result type.
+    /// Set the TaskState pool size per result type.
     ///
     /// Each unique result type `R` used with `spawn_compute::<F, R>()` gets its own
     /// pool of this size. Default is 64.
@@ -185,13 +185,13 @@ impl LoomBuilder {
     ///
     /// ```ignore
     /// let runtime = LoomBuilder::new()
-    ///     .compute_pool_size(128)  // For high-concurrency workloads
+    ///     .task_state_pool_size(128)  // For high-concurrency workloads
     ///     .build()?;
     /// ```
-    pub fn compute_pool_size(mut self, size: usize) -> Self {
+    pub fn task_state_pool_size(mut self, size: usize) -> Self {
         self.figment = self
             .figment
-            .merge(Serialized::default("compute_pool_size", size));
+            .merge(Serialized::default("task_state_pool_size", size));
         self
     }
 

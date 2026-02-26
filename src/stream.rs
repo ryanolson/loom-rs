@@ -577,7 +577,7 @@ mod tests {
             prefix: "stream-test".to_string(),
             tokio_threads: Some(1),
             rayon_threads: Some(2),
-            compute_pool_size: DEFAULT_POOL_SIZE,
+            task_state_pool_size: DEFAULT_POOL_SIZE,
             pin_threads: false, // Disable pinning in tests for portability
             #[cfg(feature = "cuda")]
             cuda_device: None,

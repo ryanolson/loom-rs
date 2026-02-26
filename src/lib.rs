@@ -95,7 +95,7 @@
 //! prefix = "myapp"
 //! tokio_threads = 2
 //! rayon_threads = 14
-//! compute_pool_size = 64
+//! task_state_pool_size = 64
 //! ```
 //!
 //! ### Environment Variables

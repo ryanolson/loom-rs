@@ -159,7 +159,7 @@ impl LoomRuntime {
     ///
     /// This is typically called via `LoomBuilder::build()`.
     pub(crate) fn from_config(config: LoomConfig) -> Result<Self> {
-        let pool_size = config.compute_pool_size;
+        let pool_size = config.task_state_pool_size;
 
         // Determine available CPUs based on process affinity and CUDA device
         //
@@ -232,6 +232,17 @@ impl LoomRuntime {
         let total_cpus = cpus.len();
         let tokio_threads = config.effective_tokio_threads();
         let rayon_threads = config.effective_rayon_threads(total_cpus);
+
+        if tokio_threads == 0 {
+            return Err(LoomError::ZeroThreadCount {
+                name: "tokio_threads",
+            });
+        }
+        if rayon_threads == 0 {
+            return Err(LoomError::ZeroThreadCount {
+                name: "rayon_threads",
+            });
+        }
 
         // Validate we have enough CPUs
         let total_threads = tokio_threads + rayon_threads;
@@ -1291,7 +1302,7 @@ mod tests {
             prefix: "test".to_string(),
             tokio_threads: Some(1),
             rayon_threads: Some(1),
-            compute_pool_size: DEFAULT_POOL_SIZE,
+            task_state_pool_size: DEFAULT_POOL_SIZE,
             pin_threads: false, // Disable pinning in tests for portability
             #[cfg(feature = "cuda")]
             cuda_device: None,
@@ -1388,6 +1399,32 @@ mod tests {
 
         let result = LoomRuntime::from_config(config);
         assert!(matches!(result, Err(LoomError::InsufficientCpus { .. })));
+    }
+
+    #[test]
+    fn test_zero_tokio_threads_error() {
+        let mut config = test_config();
+        config.tokio_threads = Some(0);
+        let result = LoomRuntime::from_config(config);
+        assert!(matches!(
+            result,
+            Err(LoomError::ZeroThreadCount {
+                name: "tokio_threads"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_zero_rayon_threads_error() {
+        let mut config = test_config();
+        config.rayon_threads = Some(0);
+        let result = LoomRuntime::from_config(config);
+        assert!(matches!(
+            result,
+            Err(LoomError::ZeroThreadCount {
+                name: "rayon_threads"
+            })
+        ));
     }
 
     #[test]

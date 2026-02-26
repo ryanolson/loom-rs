@@ -47,6 +47,13 @@ pub enum LoomError {
     #[error("requested {requested} threads but only {available} CPUs available")]
     InsufficientCpus { requested: usize, available: usize },
 
+    /// Thread count is zero, which is not valid.
+    #[error("{name} must be at least 1")]
+    ZeroThreadCount {
+        /// Which thread pool has the invalid count ("tokio_threads" or "rayon_threads")
+        name: &'static str,
+    },
+
     /// CUDA device cpuset has no overlap with process affinity mask.
     #[cfg(feature = "cuda")]
     #[error(
