@@ -107,6 +107,8 @@ impl SimulationRuntime {
 
     /// Advance to the next scheduled event time and process all work there.
     ///
+    /// Advance the simulation by one DES event timestamp.
+    ///
     /// The DES contract:
     /// 1. Peek next time T from the event queue
     /// 2. Advance tokio's virtual clock to T (resolves framework timers)
@@ -115,6 +117,17 @@ impl SimulationRuntime {
     /// 5. Drain reactive async work spawned by those actions
     /// 6. Repeat 4-5 for zero-delay cascading (new actions at same T)
     /// 7. Livelock guard: error if > 100k actions at one timestamp
+    ///
+    /// # Clock ordering invariant
+    ///
+    /// The DES clock (`SimHandle::now()`) is updated **before** `tokio::time::advance()`
+    /// is called. Tasks polled during `advance()` therefore observe the new simulation
+    /// time via `SimHandle::now()`, but `tokio::time::Instant::now()` is updated
+    /// concurrently by the tokio runtime internals.
+    ///
+    /// **Do not mix** `tokio::time::Instant::now()` with `SimHandle::now()` within a
+    /// single `step()` call — the two clocks may momentarily disagree. Always use
+    /// `SimHandle::now()` for simulation-time observations to avoid surprises.
     pub fn step(&mut self) -> crate::Result<StepOutcome> {
         // Drain first: spawned tasks may not have been polled yet, so their
         // DelayFutures/tokio timers haven't registered. This first poll

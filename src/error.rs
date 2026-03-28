@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 /// Errors that can occur when building or using a Loom runtime.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum LoomError {
     /// Error parsing CPU set string.
