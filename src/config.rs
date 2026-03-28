@@ -9,6 +9,17 @@ use crate::mab::{CalibrationConfig, MabKnobs};
 use crate::pool::DEFAULT_POOL_SIZE;
 use prometheus::Registry;
 
+/// Tokio runtime flavor.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokioFlavor {
+    /// Multi-threaded runtime (default for production).
+    #[default]
+    MultiThread,
+    /// Single-threaded runtime (required for simulation mode).
+    CurrentThread,
+}
+
 /// Configuration for the Loom runtime.
 ///
 /// This struct can be deserialized from TOML, YAML, JSON, or environment variables
@@ -34,6 +45,19 @@ pub struct LoomConfig {
     /// Whether to pin threads to specific CPUs (default: true)
     #[serde(default = "default_pin_threads")]
     pub pin_threads: bool,
+
+    /// Tokio runtime flavor (default: MultiThread).
+    #[serde(default)]
+    pub tokio_flavor: TokioFlavor,
+
+    /// Whether this runtime is in simulation mode.
+    ///
+    /// Set internally by `SimulationRuntime::new()` via the builder.
+    /// Not deserializable — cannot be set via config files or env vars.
+    /// Runtime behavior checks `sim_handle` presence, not this flag.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub simulation_mode: bool,
 
     /// CUDA device selection (feature-gated)
     #[cfg(feature = "cuda")]
@@ -77,6 +101,8 @@ impl Default for LoomConfig {
             rayon_threads: None,
             compute_pool_size: default_compute_pool_size(),
             pin_threads: default_pin_threads(),
+            tokio_flavor: TokioFlavor::default(),
+            simulation_mode: false,
             #[cfg(feature = "cuda")]
             cuda_device: None,
             mab_knobs: None,
@@ -195,6 +221,20 @@ mod tests {
         assert!(
             serialized.contains("pin_threads = false"),
             "serialized config should contain pin_threads = false"
+        );
+    }
+
+    #[test]
+    fn test_simulation_mode_not_deserializable() {
+        let toml = r#"
+            prefix = "test"
+            simulation_mode = true
+        "#;
+
+        let config: LoomConfig = toml::from_str(toml).unwrap();
+        assert!(
+            !config.simulation_mode,
+            "simulation_mode must not be settable via config deserialization"
         );
     }
 }

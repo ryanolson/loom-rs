@@ -171,8 +171,20 @@ pub mod stream;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "sim")]
+pub mod sim;
+
 pub use builder::{LoomArgs, LoomBuilder};
-pub use config::LoomConfig;
+
+/// Get the simulation handle from the current runtime context.
+///
+/// Returns `Some` when called within a simulation runtime,
+/// `None` otherwise (including when not in any runtime context).
+#[cfg(feature = "sim")]
+pub fn sim_handle() -> Option<sim::SimHandle> {
+    current_runtime().and_then(|rt| rt.sim_handle().cloned())
+}
+pub use config::{LoomConfig, TokioFlavor};
 pub use context::current_runtime;
 pub use error::{LoomError, Result};
 pub use loom_macros::test;

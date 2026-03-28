@@ -259,6 +259,12 @@ where
         // Initialize state on first poll
         let state = this.state.get_or_insert_with(|| {
             let runtime = current_runtime().expect("compute_map used outside loom runtime");
+            if runtime.is_sim_mode() {
+                panic!(
+                    "loom_rs ComputeStreamExt::compute_map() is not supported in simulation mode. \
+                     Use a simulated component with SimHandle for DES scheduling."
+                );
+            }
             let pool = runtime.inner.pools.get_or_create::<U>();
             let task_state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
@@ -435,6 +441,12 @@ where
         // Initialize state on first poll
         let state = this.state.get_or_insert_with(|| {
             let runtime = current_runtime().expect("adaptive_map used outside loom runtime");
+            if runtime.is_sim_mode() {
+                panic!(
+                    "loom_rs ComputeStreamExt::adaptive_map() is not supported in simulation mode. \
+                     Use a simulated component with SimHandle for DES scheduling."
+                );
+            }
             let pool = runtime.inner.pools.get_or_create::<U>();
             let task_state = pool.pop().unwrap_or_else(|| Arc::new(TaskState::new()));
 
@@ -579,6 +591,8 @@ mod tests {
             rayon_threads: Some(2),
             compute_pool_size: DEFAULT_POOL_SIZE,
             pin_threads: false, // Disable pinning in tests for portability
+            tokio_flavor: Default::default(),
+            simulation_mode: false,
             #[cfg(feature = "cuda")]
             cuda_device: None,
             mab_knobs: None,

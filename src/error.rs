@@ -47,6 +47,15 @@ pub enum LoomError {
     #[error("requested {requested} threads but only {available} CPUs available")]
     InsufficientCpus { requested: usize, available: usize },
 
+    /// Livelock detected: too many zero-delay events at a single simulation timestamp.
+    #[error("simulation livelock at {time:?}: {actions} actions at single timestamp")]
+    SimLivelock {
+        /// The virtual time at which the livelock was detected
+        time: std::time::Duration,
+        /// Number of actions processed before the guard triggered
+        actions: usize,
+    },
+
     /// CUDA device cpuset has no overlap with process affinity mask.
     #[cfg(feature = "cuda")]
     #[error(

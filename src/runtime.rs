@@ -118,6 +118,9 @@ pub(crate) struct LoomRuntimeInner {
     compute_state: ComputeTaskState,
     /// Per-type object pools for zero-allocation spawn_compute
     pub(crate) pools: TaskStatePool,
+    /// SimHandle for simulated compute capture (sim feature only)
+    #[cfg(feature = "sim")]
+    pub(crate) sim_handle: OnceLock<crate::sim::SimHandle>,
     /// Number of tokio worker threads
     pub(crate) tokio_threads: usize,
     /// Number of rayon worker threads
@@ -233,13 +236,16 @@ impl LoomRuntime {
         let tokio_threads = config.effective_tokio_threads();
         let rayon_threads = config.effective_rayon_threads(total_cpus);
 
-        // Validate we have enough CPUs
-        let total_threads = tokio_threads + rayon_threads;
-        if total_threads > total_cpus {
-            return Err(LoomError::InsufficientCpus {
-                requested: total_threads,
-                available: total_cpus,
-            });
+        // Validate we have enough CPUs (skip in simulation mode since
+        // CurrentThread tokio doesn't spawn workers and rayon is disabled)
+        if !config.simulation_mode {
+            let total_threads = tokio_threads + rayon_threads;
+            if total_threads > total_cpus {
+                return Err(LoomError::InsufficientCpus {
+                    requested: total_threads,
+                    available: total_cpus,
+                });
+            }
         }
 
         // Split CPUs between tokio and rayon
@@ -279,6 +285,7 @@ impl LoomRuntime {
                 tokio_cpus.clone(),
                 weak_clone.clone(),
                 pin_threads,
+                config.tokio_flavor,
             )
             .expect("failed to build tokio runtime");
 
@@ -312,6 +319,8 @@ impl LoomRuntime {
                 task_tracker: TaskTracker::new(),
                 compute_state: ComputeTaskState::new(),
                 pools: TaskStatePool::new(pool_size),
+                #[cfg(feature = "sim")]
+                sim_handle: OnceLock::new(),
                 tokio_threads,
                 rayon_threads,
                 tokio_cpus,
@@ -332,45 +341,64 @@ impl LoomRuntime {
         cpus: Vec<usize>,
         runtime_weak: Weak<LoomRuntimeInner>,
         pin_threads: bool,
+        flavor: crate::config::TokioFlavor,
     ) -> Result<tokio::runtime::Runtime> {
-        let allocator = Arc::new(CpuAllocator::new(cpus));
-        let prefix_clone = Arc::clone(prefix);
+        use crate::config::TokioFlavor;
 
-        // Thread name counter
-        let thread_counter = Arc::new(AtomicUsize::new(0));
-        let name_prefix = Arc::clone(prefix);
+        match flavor {
+            TokioFlavor::MultiThread => {
+                let allocator = Arc::new(CpuAllocator::new(cpus));
+                let prefix_clone = Arc::clone(prefix);
 
-        let start_weak = runtime_weak.clone();
-        let start_allocator = allocator.clone();
-        let start_prefix = prefix_clone.clone();
+                // Thread name counter
+                let thread_counter = Arc::new(AtomicUsize::new(0));
+                let name_prefix = Arc::clone(prefix);
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(num_threads)
-            .thread_name_fn(move || {
-                let id = thread_counter.fetch_add(1, Ordering::SeqCst);
-                format!("{}-tokio-{:04}", name_prefix, id)
-            })
-            .on_thread_start(move || {
-                // Pin CPU (if enabled)
-                if pin_threads {
-                    let cpu_id = start_allocator.allocate();
-                    if let Err(e) = pin_to_cpu(cpu_id) {
-                        warn!(%e, %start_prefix, cpu_id, "failed to pin tokio thread");
-                    } else {
-                        debug!(cpu_id, %start_prefix, "pinned tokio thread to CPU");
-                    }
-                }
+                let start_weak = runtime_weak.clone();
+                let start_allocator = allocator.clone();
+                let start_prefix = prefix_clone.clone();
 
-                // Inject runtime reference into thread-local
-                set_current_runtime(start_weak.clone());
-            })
-            .on_thread_stop(|| {
-                clear_current_runtime();
-            })
-            .enable_all()
-            .build()?;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(num_threads)
+                    .thread_name_fn(move || {
+                        let id = thread_counter.fetch_add(1, Ordering::SeqCst);
+                        format!("{}-tokio-{:04}", name_prefix, id)
+                    })
+                    .on_thread_start(move || {
+                        if pin_threads {
+                            let cpu_id = start_allocator.allocate();
+                            if let Err(e) = pin_to_cpu(cpu_id) {
+                                warn!(%e, %start_prefix, cpu_id, "failed to pin tokio thread");
+                            } else {
+                                debug!(cpu_id, %start_prefix, "pinned tokio thread to CPU");
+                            }
+                        }
+                        set_current_runtime(start_weak.clone());
+                    })
+                    .on_thread_stop(|| {
+                        clear_current_runtime();
+                    })
+                    .enable_all()
+                    .build()?;
 
-        Ok(runtime)
+                Ok(runtime)
+            }
+            TokioFlavor::CurrentThread => {
+                let start_weak = runtime_weak.clone();
+
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .on_thread_start(move || {
+                        set_current_runtime(start_weak.clone());
+                    })
+                    .on_thread_stop(|| {
+                        clear_current_runtime();
+                    })
+                    .enable_all()
+                    .build()?;
+
+                Ok(runtime)
+            }
+        }
     }
 
     fn build_rayon_pool(
@@ -416,6 +444,31 @@ impl LoomRuntime {
         &self.inner.config
     }
 
+    /// Returns `true` when this runtime is in simulation mode.
+    ///
+    /// Simulation mode is active when a [`SimHandle`](crate::sim::SimHandle)
+    /// has been injected by [`SimulationRuntime::new()`](crate::sim::SimulationRuntime::new).
+    #[inline]
+    pub fn is_sim_mode(&self) -> bool {
+        #[cfg(feature = "sim")]
+        {
+            self.inner.sim_handle.get().is_some()
+        }
+        #[cfg(not(feature = "sim"))]
+        {
+            false
+        }
+    }
+
+    /// Get the simulation handle, if this runtime is in simulation mode.
+    ///
+    /// Returns `Some` when running inside a
+    /// [`SimulationRuntime`](crate::sim::SimulationRuntime), `None` otherwise.
+    #[cfg(feature = "sim")]
+    pub fn sim_handle(&self) -> Option<&crate::sim::SimHandle> {
+        self.inner.sim_handle.get()
+    }
+
     /// Get the tokio runtime handle.
     ///
     /// This can be used to spawn untracked tasks or enter the runtime context.
@@ -433,6 +486,55 @@ impl LoomRuntime {
         &self.inner.tokio_runtime
     }
 
+    /// Panics if called in simulation mode. Used to guard rayon-backed APIs
+    /// that have no simulated alternative (e.g. `rayon_pool()`).
+    #[inline]
+    fn assert_not_sim(&self, api_name: &str) {
+        if self.is_sim_mode() {
+            panic!(
+                "loom_rs::{api_name}() is not supported in simulation mode. \
+                 Use a simulated component with SimHandle for DES scheduling."
+            );
+        }
+    }
+
+    /// Run a closure inline and delay by its measured wall-clock time in virtual time.
+    /// Used by spawn_compute/spawn_adaptive in simulation mode.
+    #[cfg(feature = "sim")]
+    async fn sim_compute_inline<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let start = std::time::Instant::now();
+        let result = f();
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        if elapsed_us > 0 {
+            if let Some(sim) = self.inner.sim_handle.get() {
+                sim.delay(std::time::Duration::from_micros(elapsed_us)).await;
+            }
+        }
+        result
+    }
+
+    /// Run a scoped closure on the 1-thread rayon pool and delay by measured time.
+    /// Used by scope_compute/scope_adaptive in simulation mode.
+    #[cfg(feature = "sim")]
+    async fn sim_scope_inline<'env, F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
+        R: Send + 'env,
+    {
+        let start = std::time::Instant::now();
+        let result = self.inner.rayon_pool.install(|| rayon::scope(f));
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        if elapsed_us > 0 {
+            if let Some(sim) = self.inner.sim_handle.get() {
+                sim.delay(std::time::Duration::from_micros(elapsed_us)).await;
+            }
+        }
+        result
+    }
+
     /// Get the rayon thread pool.
     ///
     /// This can be used to execute parallel iterators or spawn untracked work directly.
@@ -443,6 +545,7 @@ impl LoomRuntime {
     ///
     /// Zero overhead - returns a reference.
     pub fn rayon_pool(&self) -> &rayon::ThreadPool {
+        self.assert_not_sim("rayon_pool");
         &self.inner.rayon_pool
     }
 
@@ -543,6 +646,10 @@ impl LoomRuntime {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(feature = "sim")]
+        if self.is_sim_mode() {
+            return self.sim_compute_inline(f).await;
+        }
         self.inner.spawn_compute(f).await
     }
 
@@ -578,6 +685,10 @@ impl LoomRuntime {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(feature = "sim")]
+        if self.is_sim_mode() {
+            return self.sim_compute_inline(f).await;
+        }
         self.spawn_adaptive_with_hint(ComputeHint::Unknown, f).await
     }
 
@@ -611,6 +722,10 @@ impl LoomRuntime {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(feature = "sim")]
+        if self.is_sim_mode() {
+            return self.sim_compute_inline(f).await;
+        }
         let ctx = self.collect_context();
         let key = FunctionKey::from_type::<F>();
         let scheduler = self.mab_scheduler();
@@ -657,6 +772,9 @@ impl LoomRuntime {
         F: FnOnce() -> R + Send,
         R: Send,
     {
+        // In sim mode, still use rayon_pool.install() so par_iter stays on
+        // loom's 1-thread pool rather than leaking to rayon's global pool.
+        // No virtual time delay (sync API).
         self.inner.rayon_pool.install(f)
     }
 
@@ -735,6 +853,10 @@ impl LoomRuntime {
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
     {
+        #[cfg(feature = "sim")]
+        if self.is_sim_mode() {
+            return self.sim_scope_inline(f).await;
+        }
         self.inner.scope_compute(f).await
     }
 
@@ -797,6 +919,10 @@ impl LoomRuntime {
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
     {
+        #[cfg(feature = "sim")]
+        if self.is_sim_mode() {
+            return self.sim_scope_inline(f).await;
+        }
         self.scope_adaptive_with_hint(ComputeHint::Unknown, f).await
     }
 
@@ -838,6 +964,10 @@ impl LoomRuntime {
         F: FnOnce(&rayon::Scope<'env>) -> R + Send + 'env,
         R: Send + 'env,
     {
+        #[cfg(feature = "sim")]
+        if self.is_sim_mode() {
+            return self.sim_scope_inline(f).await;
+        }
         let ctx = self.collect_context();
         // Use from_type_name since F may capture non-'static references
         let key = FunctionKey::from_type_name::<F>();
@@ -1292,6 +1422,8 @@ mod tests {
             rayon_threads: Some(1),
             compute_pool_size: DEFAULT_POOL_SIZE,
             pin_threads: false, // Disable pinning in tests for portability
+            tokio_flavor: Default::default(),
+            simulation_mode: false,
             #[cfg(feature = "cuda")]
             cuda_device: None,
             mab_knobs: None,

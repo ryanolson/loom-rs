@@ -38,6 +38,7 @@ nvml-wrapper = { version = "0.10", optional = true }
 
 [features]
 default = []
+sim = ["tokio/test-util"]
 cuda = ["hwlocality", "nvml-wrapper"]
 cuda-tests = ["cuda"]  # Enable hardware-dependent CUDA tests
 
@@ -53,6 +54,14 @@ name = "wake_latency_benchmark"
 
 [[example]]
 name = "adaptive_workload"
+
+[[example]]
+name = "sim_ping_pong"
+required-features = ["sim"]
+
+[[example]]
+name = "sim_pipeline"
+required-features = ["sim"]
 
 [[bench]]
 name = "runtime"

@@ -7,7 +7,7 @@
 //! - Programmatic overrides
 //! - CLI arguments via clap
 
-use crate::config::LoomConfig;
+use crate::config::{LoomConfig, TokioFlavor};
 use crate::error::Result;
 use crate::mab::{CalibrationConfig, MabKnobs};
 use crate::runtime::LoomRuntime;
@@ -43,6 +43,7 @@ use crate::cuda::CudaDeviceSelector;
 pub struct LoomBuilder {
     figment: Figment,
     prometheus_registry: Option<Registry>,
+    sim_mode: bool,
 }
 
 impl Default for LoomBuilder {
@@ -69,6 +70,7 @@ impl LoomBuilder {
         Self {
             figment: Figment::from(Serialized::defaults(LoomConfig::default())),
             prometheus_registry: None,
+            sim_mode: false,
         }
     }
 
@@ -167,6 +169,42 @@ impl LoomBuilder {
     /// ```
     pub fn pin_threads(mut self, pin: bool) -> Self {
         self.figment = self.figment.merge(Serialized::default("pin_threads", pin));
+        self
+    }
+
+    /// Set the tokio runtime flavor.
+    ///
+    /// `CurrentThread` is required for simulation mode (set automatically by
+    /// `simulation_mode(true)`). Most users should not call this directly.
+    pub fn tokio_flavor(mut self, flavor: TokioFlavor) -> Self {
+        self.figment = self
+            .figment
+            .merge(Serialized::default("tokio_flavor", flavor));
+        self
+    }
+
+    /// Enable simulation mode (used internally by `SimulationRuntime`).
+    ///
+    /// When enabled, automatically applies:
+    /// - `tokio_flavor(CurrentThread)` (required for virtual time)
+    /// - `pin_threads(false)`
+    /// - `tokio_threads(1)`
+    /// - `rayon_threads(1)`
+    ///
+    /// This is `pub(crate)` because simulation mode requires additional
+    /// setup (tokio time::pause, sim_handle injection) that only
+    /// `SimulationRuntime::new()` performs. Use `SimulationRuntime` instead.
+    #[cfg(feature = "sim")]
+    pub(crate) fn simulation_mode(mut self, enabled: bool) -> Self {
+        self.sim_mode = enabled;
+        if enabled {
+            self.figment = self
+                .figment
+                .merge(Serialized::default("tokio_flavor", TokioFlavor::CurrentThread))
+                .merge(Serialized::default("pin_threads", false))
+                .merge(Serialized::default("tokio_threads", 1u32))
+                .merge(Serialized::default("rayon_threads", 1u32));
+        }
         self
     }
 
@@ -365,6 +403,7 @@ impl LoomBuilder {
     pub fn build(self) -> Result<LoomRuntime> {
         let mut config: LoomConfig = self.figment.extract().map_err(Box::new)?;
         config.prometheus_registry = self.prometheus_registry;
+        config.simulation_mode = self.sim_mode;
         LoomRuntime::from_config(config)
     }
 }
