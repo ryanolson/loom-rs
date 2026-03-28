@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 /// Errors that can occur when building or using a Loom runtime.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum LoomError {
     /// Error parsing CPU set string.
@@ -44,6 +45,13 @@ pub enum LoomError {
         time: std::time::Duration,
         /// Number of actions processed before the guard triggered
         actions: usize,
+    },
+
+    /// Simulation stalled: DES queue emptied before target task completed.
+    #[error("simulation stalled at {time:?}: task did not complete and no more events remain")]
+    SimStall {
+        /// The virtual time at which the stall was detected
+        time: std::time::Duration,
     },
 }
 

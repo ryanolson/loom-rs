@@ -138,6 +138,8 @@ Good sim tests assert:
 - event ordering
 - state at specific checkpoints
 
+Always use `SimHandle::now()` for simulation-time observations. Do not use `tokio::time::Instant::now()` — the DES clock is updated before `tokio::time::advance()` is called inside `step()`, so the two clocks can momentarily disagree during the same advance. Code that mixes them may observe an inconsistent snapshot.
+
 Avoid assertions on host runtime duration unless you are explicitly measuring simulator overhead.
 
 ### Treat simulated compute as approximate
@@ -170,6 +172,7 @@ Simulation mode is a constrained runtime:
 - Expecting `run()` to advance pure Tokio timers when there are no live sim events.
 - Using wall-clock sleeps instead of virtual-time delays.
 - Writing tests that only assert outputs and never assert virtual-time progression.
+- Mixing `tokio::time::Instant::now()` with `SimHandle::now()` — use `SimHandle::now()` exclusively for simulation-time observations.
 
 ## Recommended Test Shapes
 
