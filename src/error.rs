@@ -45,7 +45,6 @@ pub enum LoomError {
         /// Number of actions processed before the guard triggered
         actions: usize,
     },
-
 }
 
 /// Result type alias for Loom operations.

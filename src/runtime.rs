@@ -468,7 +468,8 @@ impl LoomRuntime {
         let elapsed_us = start.elapsed().as_micros() as u64;
         if elapsed_us > 0 {
             if let Some(sim) = self.inner.sim_handle.get() {
-                sim.delay(std::time::Duration::from_micros(elapsed_us)).await;
+                sim.delay(std::time::Duration::from_micros(elapsed_us))
+                    .await;
             }
         }
         result
@@ -487,7 +488,8 @@ impl LoomRuntime {
         let elapsed_us = start.elapsed().as_micros() as u64;
         if elapsed_us > 0 {
             if let Some(sim) = self.inner.sim_handle.get() {
-                sim.delay(std::time::Duration::from_micros(elapsed_us)).await;
+                sim.delay(std::time::Duration::from_micros(elapsed_us))
+                    .await;
             }
         }
         result

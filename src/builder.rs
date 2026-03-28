@@ -197,7 +197,10 @@ impl LoomBuilder {
         if enabled {
             self.figment = self
                 .figment
-                .merge(Serialized::default("tokio_flavor", TokioFlavor::CurrentThread))
+                .merge(Serialized::default(
+                    "tokio_flavor",
+                    TokioFlavor::CurrentThread,
+                ))
                 .merge(Serialized::default("pin_threads", false))
                 .merge(Serialized::default("tokio_threads", 1u32))
                 .merge(Serialized::default("rayon_threads", 1u32));

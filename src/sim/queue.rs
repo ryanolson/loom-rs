@@ -75,13 +75,12 @@ impl EventQueue {
         let seq = self.seq_counter;
         self.seq_counter += 1;
         let canceled = Arc::new(AtomicBool::new(false));
-        self.heap
-            .push(std::cmp::Reverse(TimedAction {
-                time,
-                seq,
-                canceled: canceled.clone(),
-                action,
-            }));
+        self.heap.push(std::cmp::Reverse(TimedAction {
+            time,
+            seq,
+            canceled: canceled.clone(),
+            action,
+        }));
         CancelHandle { canceled }
     }
 
@@ -140,10 +139,13 @@ mod tests {
 
         for i in 0..3 {
             let o = order.clone();
-            q.insert(t, Box::new(move || {
-                let prev = o.fetch_add(1, AtomicOrdering::SeqCst);
-                assert_eq!(prev, i);
-            }));
+            q.insert(
+                t,
+                Box::new(move || {
+                    let prev = o.fetch_add(1, AtomicOrdering::SeqCst);
+                    assert_eq!(prev, i);
+                }),
+            );
         }
 
         // All three should fire at t=1s in insertion order

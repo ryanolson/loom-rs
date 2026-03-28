@@ -45,19 +45,13 @@ impl SimHandle {
     /// Returns immediately. The closure runs when the simulation steps to its target time.
     pub fn schedule(&self, delay: Duration, action: impl FnOnce() + Send + 'static) {
         let time = self.now() + delay;
-        self.queue
-            .lock()
-            .unwrap()
-            .insert(time, Box::new(action));
+        self.queue.lock().unwrap().insert(time, Box::new(action));
     }
 
     /// Schedule a closure at an absolute virtual time.
     pub fn schedule_at(&self, time: SimTime, action: impl FnOnce() + Send + 'static) {
         self.assert_not_past("schedule_at", time);
-        self.queue
-            .lock()
-            .unwrap()
-            .insert(time, Box::new(action));
+        self.queue.lock().unwrap().insert(time, Box::new(action));
     }
 
     /// Suspend this async task for `duration` of virtual time.
@@ -94,10 +88,12 @@ impl SimHandle {
         F: Future<Output = ()> + Send + 'static,
     {
         let time = self.now() + delay;
-        self.queue
-            .lock()
-            .unwrap()
-            .insert(time, Box::new(move || { tokio::spawn(fut); }));
+        self.queue.lock().unwrap().insert(
+            time,
+            Box::new(move || {
+                tokio::spawn(fut);
+            }),
+        );
     }
 
     /// Spawn an async task at an absolute virtual time.
@@ -106,10 +102,12 @@ impl SimHandle {
         F: Future<Output = ()> + Send + 'static,
     {
         self.assert_not_past("spawn_at", time);
-        self.queue
-            .lock()
-            .unwrap()
-            .insert(time, Box::new(move || { tokio::spawn(fut); }));
+        self.queue.lock().unwrap().insert(
+            time,
+            Box::new(move || {
+                tokio::spawn(fut);
+            }),
+        );
     }
 
     /// Current virtual time.
