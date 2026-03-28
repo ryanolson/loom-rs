@@ -11,6 +11,9 @@ categories = ["asynchronous", "concurrency"]
 [workspace]
 members = ["loom-macros"]
 
+[workspace.dependencies]
+loom-macros = { path = "loom-macros", version = "0.4.0" }
+
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
@@ -18,7 +21,7 @@ license = "MIT"
 repository = "https://github.com/ryanolson/loom-rs"
 
 [dependencies]
-loom-macros = { path = "loom-macros", version = "0.4.0" }
+loom-macros.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 rayon = "1.10"

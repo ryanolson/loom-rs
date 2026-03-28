@@ -53,3 +53,5 @@ jobs:
         with:
           fetch-depth: 0
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          workspace: true
