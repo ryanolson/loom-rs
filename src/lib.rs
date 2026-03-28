@@ -142,14 +142,15 @@
 
 pub(crate) mod affinity;
 pub(crate) mod bridge;
+pub(crate) mod context;
+pub(crate) mod pool;
+
 pub mod builder;
 pub mod config;
-pub(crate) mod context;
 pub mod cpuset;
 pub mod error;
 pub mod mab;
 pub mod metrics;
-pub(crate) mod pool;
 pub mod runtime;
 pub mod stream;
 
