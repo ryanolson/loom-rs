@@ -48,17 +48,7 @@ jobs:
       - name: Check documentation
         run: cargo doc --no-deps
 
-      - name: Publish loom-macros to crates.io
-        if: steps.check-macros.outputs.skip != 'true'
-        run: cargo publish --manifest-path loom-macros/Cargo.toml
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index update
-        if: steps.check-macros.outputs.skip != 'true'
-        run: sleep 30
-
       - name: Publish loom-rs to crates.io
-        run: cargo publish
+        run: cargo publish --workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
