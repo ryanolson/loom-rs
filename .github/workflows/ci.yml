@@ -20,12 +20,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libudev-dev
       - run: cargo fmt -- --check
       - run: cargo fmt --manifest-path loom-macros/Cargo.toml -- --check
       - run: cargo clippy --all-targets -- -D warnings -A deprecated
-      - run: cargo clippy --all-targets --features cuda -- -D warnings -A deprecated
       - run: cargo clippy --manifest-path loom-macros/Cargo.toml --all-targets -- -D warnings -A deprecated
 
   test:
@@ -55,6 +52,4 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libudev-dev
       - uses: obi1kenobi/cargo-semver-checks-action@v2

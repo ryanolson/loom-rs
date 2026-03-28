@@ -10,14 +10,13 @@ A Rust crate providing a bespoke thread pool runtime combining tokio and rayon w
 - **CPU Pinning**: Automatically pins threads to specific CPUs for consistent performance
 - **Flexible Configuration**: Configure via files (TOML/YAML/JSON), environment variables, or code
 - **CLI Integration**: Built-in clap support for command-line overrides
-- **CUDA NUMA Awareness**: Optional feature for selecting CPUs local to a GPU (Linux only)
 - **Adaptive Scheduling**: [MAB-based scheduler](docs/mab.md) learns optimal inline vs offload decisions
 
 ## Platform Support
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| Linux | **Full support** | All features including CPU pinning and CUDA |
+| Linux | **Full support** | All features including CPU pinning |
 | macOS | Partial | Compiles and runs, but CPU pinning may silently fail |
 | Windows | Partial | Compiles and runs, but CPU pinning may silently fail |
 
@@ -27,12 +26,6 @@ A Rust crate providing a bespoke thread pool runtime combining tokio and rayon w
 
 ```bash
 cargo add loom-rs
-```
-
-For CUDA support (Linux only):
-
-```bash
-cargo add loom-rs --features cuda
 ```
 
 ## Quick Start
@@ -133,8 +126,6 @@ Available CLI arguments:
 - `--loom-prefix`: Thread name prefix
 - `--loom-tokio-threads`: Number of tokio threads
 - `--loom-rayon-threads`: Number of rayon threads
-- `--loom-cuda-device`: CUDA device ID or UUID (requires `cuda` feature)
-
 ## CPU Affinity
 
 When `pin_threads = true` (the default), loom automatically discovers the
@@ -144,40 +135,12 @@ process's allowed CPU set via `sched_getaffinity` on Linux. This respects:
 - **taskset restrictions**: `taskset -c 0-3 ./myapp`
 - **NUMA policies**: `numactl --cpunodebind=0`
 
-When using CUDA (`cuda_device` option), the CUDA device's NUMA-local CPUs
-are intersected with the process affinity mask to ensure optimal data locality.
-
 Use `runtime.effective_cpuset()` to inspect which CPUs the runtime is using:
 
 ```rust
 let runtime = LoomBuilder::new().build()?;
 println!("Using CPUs: {:?}", runtime.effective_cpuset());
 ```
-
-## CUDA Support
-
-With the `cuda` feature enabled (Linux only), configure the runtime to use CPUs local to a specific GPU.
-
-### System Dependencies
-
-```bash
-sudo apt-get install libhwloc-dev libudev-dev
-```
-
-### Usage
-
-```rust
-let runtime = LoomBuilder::new()
-    .cuda_device_id(0)  // Use CPUs near GPU 0
-    .build()?;
-
-// Or by UUID
-let runtime = LoomBuilder::new()
-    .cuda_device_uuid("GPU-12345678-1234-1234-1234-123456789012")
-    .build()?;
-```
-
-This is useful for GPU-accelerated workloads where data needs to be transferred between CPU and GPU memory, as it minimizes NUMA-related latency.
 
 ## Thread Naming
 

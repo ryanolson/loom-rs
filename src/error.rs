@@ -33,16 +33,6 @@ pub enum LoomError {
     #[error("failed to set thread affinity for CPU {0}")]
     AffinityFailed(usize),
 
-    /// CUDA-related errors (feature-gated).
-    #[cfg(feature = "cuda")]
-    #[error("CUDA error: {0}")]
-    Cuda(String),
-
-    /// NVML initialization or query error (feature-gated).
-    #[cfg(feature = "cuda")]
-    #[error("NVML error: {0}")]
-    Nvml(#[from] nvml_wrapper::error::NvmlError),
-
     /// Thread count mismatch - not enough CPUs for requested threads.
     #[error("requested {requested} threads but only {available} CPUs available")]
     InsufficientCpus { requested: usize, available: usize },
@@ -56,17 +46,6 @@ pub enum LoomError {
         actions: usize,
     },
 
-    /// CUDA device cpuset has no overlap with process affinity mask.
-    #[cfg(feature = "cuda")]
-    #[error(
-        "CUDA device cpuset {cuda_cpuset} has no overlap with process affinity mask {process_mask}"
-    )]
-    CudaCpusetNoOverlap {
-        /// The CUDA device's local CPU set
-        cuda_cpuset: String,
-        /// The process affinity mask
-        process_mask: String,
-    },
 }
 
 /// Result type alias for Loom operations.

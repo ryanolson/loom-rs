@@ -14,7 +14,6 @@
 //! - **Scoped Compute**: `scope_compute()` allows borrowing local data for parallel work
 //! - **Flexible Configuration**: Configure via files (TOML/YAML/JSON), environment variables, or code
 //! - **CLI Integration**: Built-in clap support for command-line overrides
-//! - **CUDA NUMA Awareness**: Optional feature for selecting CPUs local to a GPU (Linux only)
 //!
 //! ## Quick Start
 //!
@@ -133,21 +132,7 @@
 //! - taskset restrictions
 //! - NUMA policies
 //!
-//! When using CUDA (`cuda_device` option), the CUDA device's NUMA-local CPUs
-//! are intersected with the process affinity mask.
-//!
 //! Use `runtime.effective_cpuset()` to inspect which CPUs the runtime is using.
-//!
-//! ## CUDA Support
-//!
-//! With the `cuda` feature enabled (Linux only), you can configure the runtime
-//! to use CPUs local to a specific CUDA GPU:
-//!
-//! ```ignore
-//! let runtime = LoomBuilder::new()
-//!     .cuda_device_id(0)  // Use CPUs near GPU 0
-//!     .build()?;
-//! ```
 //!
 //! ## Thread Naming
 //!
@@ -167,9 +152,6 @@ pub mod metrics;
 pub(crate) mod pool;
 pub mod runtime;
 pub mod stream;
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
 
 #[cfg(feature = "sim")]
 pub mod sim;

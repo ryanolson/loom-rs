@@ -17,9 +17,6 @@ use figment::Figment;
 use prometheus::Registry;
 use std::path::Path;
 
-#[cfg(feature = "cuda")]
-use crate::cuda::CudaDeviceSelector;
-
 /// Builder for constructing a `LoomRuntime`.
 ///
 /// Configuration sources are merged in the following order (later sources override earlier):
@@ -326,32 +323,6 @@ impl LoomBuilder {
         self
     }
 
-    /// Set the CUDA device by ID.
-    ///
-    /// This will configure the runtime to use CPUs local to the specified
-    /// CUDA device's NUMA node.
-    #[cfg(feature = "cuda")]
-    pub fn cuda_device_id(mut self, id: u32) -> Self {
-        self.figment = self.figment.merge(Serialized::default(
-            "cuda_device",
-            CudaDeviceSelector::DeviceId(id),
-        ));
-        self
-    }
-
-    /// Set the CUDA device by UUID.
-    ///
-    /// This will configure the runtime to use CPUs local to the specified
-    /// CUDA device's NUMA node.
-    #[cfg(feature = "cuda")]
-    pub fn cuda_device_uuid(mut self, uuid: impl Into<String>) -> Self {
-        self.figment = self.figment.merge(Serialized::default(
-            "cuda_device",
-            CudaDeviceSelector::Uuid(uuid.into()),
-        ));
-        self
-    }
-
     /// Apply CLI argument overrides.
     ///
     /// This method applies any non-None values from the `LoomArgs` struct.
@@ -370,21 +341,6 @@ impl LoomBuilder {
             self.figment = self
                 .figment
                 .merge(Serialized::default("rayon_threads", threads));
-        }
-        #[cfg(feature = "cuda")]
-        if let Some(ref device) = args.loom_cuda_device {
-            // Parse device string - could be a number or UUID
-            if let Ok(id) = device.parse::<u32>() {
-                self.figment = self.figment.merge(Serialized::default(
-                    "cuda_device",
-                    CudaDeviceSelector::DeviceId(id),
-                ));
-            } else {
-                self.figment = self.figment.merge(Serialized::default(
-                    "cuda_device",
-                    CudaDeviceSelector::Uuid(device.clone()),
-                ));
-            }
         }
         self
     }
@@ -444,11 +400,6 @@ pub struct LoomArgs {
     /// Number of rayon threads
     #[arg(long)]
     pub loom_rayon_threads: Option<usize>,
-
-    /// CUDA device ID or UUID
-    #[cfg(feature = "cuda")]
-    #[arg(long)]
-    pub loom_cuda_device: Option<String>,
 }
 
 #[cfg(test)]
@@ -485,8 +436,6 @@ mod tests {
             loom_prefix: Some("cliapp".to_string()),
             loom_tokio_threads: Some(1),
             loom_rayon_threads: Some(3),
-            #[cfg(feature = "cuda")]
-            loom_cuda_device: None,
         };
 
         let config: LoomConfig = LoomBuilder::new()
@@ -508,8 +457,6 @@ mod tests {
             loom_prefix: Some("cliapp".to_string()),
             loom_tokio_threads: None,
             loom_rayon_threads: None,
-            #[cfg(feature = "cuda")]
-            loom_cuda_device: None,
         };
 
         let config: LoomConfig = LoomBuilder::new()

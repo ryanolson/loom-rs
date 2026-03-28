@@ -2,9 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "cuda")]
-use crate::cuda::CudaDeviceSelector;
-
 use crate::mab::{CalibrationConfig, MabKnobs};
 use crate::pool::DEFAULT_POOL_SIZE;
 use prometheus::Registry;
@@ -59,11 +56,6 @@ pub struct LoomConfig {
     #[serde(skip)]
     pub simulation_mode: bool,
 
-    /// CUDA device selection (feature-gated)
-    #[cfg(feature = "cuda")]
-    #[serde(default)]
-    pub cuda_device: Option<CudaDeviceSelector>,
-
     /// MAB scheduler configuration knobs.
     /// If None, default knobs are used.
     #[serde(default)]
@@ -103,8 +95,6 @@ impl Default for LoomConfig {
             pin_threads: default_pin_threads(),
             tokio_flavor: TokioFlavor::default(),
             simulation_mode: false,
-            #[cfg(feature = "cuda")]
-            cuda_device: None,
             mab_knobs: None,
             calibration: None,
             prometheus_registry: None,

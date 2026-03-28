@@ -593,8 +593,6 @@ mod tests {
             pin_threads: false, // Disable pinning in tests for portability
             tokio_flavor: Default::default(),
             simulation_mode: false,
-            #[cfg(feature = "cuda")]
-            cuda_device: None,
             mab_knobs: None,
             calibration: None,
             prometheus_registry: None,

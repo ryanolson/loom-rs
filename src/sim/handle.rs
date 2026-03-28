@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use super::queue::EventQueue;
+use super::queue::{CancelHandle, EventQueue};
 use super::time::SimTime;
 
 /// Handle for simulated components to interact with the DES scheduler.
@@ -32,6 +32,14 @@ pub struct SimHandle {
 }
 
 impl SimHandle {
+    fn assert_not_past(&self, api_name: &str, time: SimTime) {
+        let now = self.now();
+        assert!(
+            time >= now,
+            "loom_rs::sim::{api_name}() cannot schedule work in the past: requested {time:?}, current virtual time {now:?}"
+        );
+    }
+
     /// Schedule a closure to execute at `now() + delay`.
     ///
     /// Returns immediately. The closure runs when the simulation steps to its target time.
@@ -45,6 +53,7 @@ impl SimHandle {
 
     /// Schedule a closure at an absolute virtual time.
     pub fn schedule_at(&self, time: SimTime, action: impl FnOnce() + Send + 'static) {
+        self.assert_not_past("schedule_at", time);
         self.queue
             .lock()
             .unwrap()
@@ -62,6 +71,7 @@ impl SimHandle {
             clock: self.clock.clone(),
             target_time: self.now() + duration,
             waker_slot: Arc::new(Mutex::new(None)),
+            cancel_handle: None,
             registered: false,
         }
     }
@@ -95,6 +105,7 @@ impl SimHandle {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.assert_not_past("spawn_at", time);
         self.queue
             .lock()
             .unwrap()
@@ -117,6 +128,7 @@ pub struct DelayFuture {
     clock: Arc<AtomicU64>,
     target_time: SimTime,
     waker_slot: Arc<Mutex<Option<Waker>>>,
+    cancel_handle: Option<CancelHandle>,
     registered: bool,
 }
 
@@ -133,7 +145,7 @@ impl Future for DelayFuture {
         if !self.registered {
             self.registered = true;
             let slot = self.waker_slot.clone();
-            self.queue.lock().unwrap().insert(
+            let cancel_handle = self.queue.lock().unwrap().insert_cancellable(
                 self.target_time,
                 Box::new(move || {
                     if let Some(w) = slot.lock().unwrap().take() {
@@ -141,7 +153,16 @@ impl Future for DelayFuture {
                     }
                 }),
             );
+            self.cancel_handle = Some(cancel_handle);
         }
         Poll::Pending
+    }
+}
+
+impl Drop for DelayFuture {
+    fn drop(&mut self) {
+        if let Some(cancel_handle) = self.cancel_handle.take() {
+            cancel_handle.cancel();
+        }
     }
 }

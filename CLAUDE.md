@@ -2,9 +2,10 @@
 
 ## Build Commands
 
-- `cargo build` - Build without CUDA feature
-- `cargo build --features cuda` - Build with CUDA feature (Linux only)
+- `cargo build` - Build without optional features
+- `cargo build --features sim` - Build with simulation feature
 - `cargo test` - Run tests
+- `cargo test --features sim` - Run tests including simulation module
 - `cargo bench` - Run all benchmarks
 - `cargo bench -- <filter>` - Run specific benchmarks (e.g., `cargo bench -- bridge`)
 - `cargo clippy -- -D warnings -A deprecated` - Lint check
@@ -16,13 +17,6 @@
 Install git hooks to auto-format on commit:
 ```bash
 ./hooks/install.sh
-```
-
-### System Dependencies (for `cuda` feature)
-
-The `cuda` feature requires hwloc system libraries (Linux only):
-```bash
-sudo apt-get install libhwloc-dev libudev-dev
 ```
 
 ## Code Style
@@ -43,18 +37,17 @@ sudo apt-get install libhwloc-dev libudev-dev
 - `bridge.rs` - Minimal-overhead async-to-rayon bridge (replaces tokio-rayon)
 - `builder.rs` - LoomBuilder with figment integration and LoomArgs for CLI
 - `runtime.rs` - LoomRuntime combining tokio + rayon
-- `cuda.rs` - CUDA NUMA selection (feature-gated, Linux only)
+- `sim/` - Discrete-event simulation runtime (feature-gated: `sim`). `SimulationRuntime` wraps `LoomRuntime` with paused virtual clock and DES event queue. Key types: `SimHandle` (scheduling/delays), `DelayFuture`, `StepOutcome`
 
 ## Features
 
 - `default` - No optional features
-- `cuda` - Enable CUDA device selection for NUMA-aware CPU pinning (requires hwlocality and nvml-wrapper, Linux only)
-- `cuda-tests` - Enable hardware-dependent CUDA tests (implies `cuda`)
+- `sim` - Enable deterministic simulation mode with virtual time (requires `tokio/test-util`)
 
 ## Testing
 
 - Unit tests are in each module
-- CUDA hardware tests require the `cuda-tests` feature: `cargo test --features cuda-tests`
+- Simulation tests require the `sim` feature: `cargo test --features sim`
 
 ## Performance Guidelines
 

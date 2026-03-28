@@ -33,14 +33,10 @@ prometheus = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-hwlocality = { version = "1.0.0-alpha.11", optional = true }
-nvml-wrapper = { version = "0.10", optional = true }
 
 [features]
 default = []
 sim = ["tokio/test-util"]
-cuda = ["hwlocality", "nvml-wrapper"]
-cuda-tests = ["cuda"]  # Enable hardware-dependent CUDA tests
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

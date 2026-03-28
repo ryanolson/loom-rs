@@ -125,6 +125,11 @@ impl SimulationRuntime {
             Some(t) => t,
             None => return Ok(StepOutcome::NoMoreEvents),
         };
+        assert!(
+            next_time >= self.current_time,
+            "simulation attempted to move backward in time: next event {next_time:?}, current time {:?}",
+            self.current_time
+        );
 
         // 1. Advance tokio's virtual clock to next_time.
         //    advance() internally calls yield_now → runtime never parks → no auto-advance.
@@ -183,6 +188,7 @@ impl SimulationRuntime {
     /// Step until virtual time reaches `deadline` or the queue is empty.
     pub fn step_until(&mut self, deadline: SimTime) -> crate::Result<()> {
         loop {
+            self.drain();
             let should_step = self
                 .queue
                 .lock()
@@ -413,6 +419,58 @@ mod tests {
     }
 
     #[test]
+    fn test_step_until_drains_pending_tasks_first() {
+        let mut sim = SimulationRuntime::new().unwrap();
+        let handle = sim.handle();
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let c = completed.clone();
+        sim.loom().spawn_async(async move {
+            handle.delay(Duration::from_millis(10)).await;
+            c.store(true, AOrdering::SeqCst);
+        });
+
+        sim.step_until(Duration::from_millis(50)).unwrap();
+        assert!(completed.load(AOrdering::SeqCst));
+        assert_eq!(sim.now(), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_schedule_and_spawn_at_past_time_panic() {
+        let mut sim = SimulationRuntime::new().unwrap();
+        sim.run_until(Duration::from_secs(1)).unwrap();
+        let handle = sim.handle();
+
+        let schedule_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            handle.schedule_at(Duration::from_millis(500), || {});
+        }));
+        assert!(schedule_result.is_err());
+
+        let spawn_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            handle.spawn_at(Duration::from_millis(500), async {});
+        }));
+        assert!(spawn_result.is_err());
+        assert_eq!(sim.now(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_runtime_invariant_prevents_time_rewind() {
+        let mut sim = SimulationRuntime::new().unwrap();
+        sim.run_until(Duration::from_secs(1)).unwrap();
+
+        sim.queue
+            .lock()
+            .unwrap()
+            .insert(Duration::from_millis(500), Box::new(|| {}));
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            sim.step().unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(sim.now(), Duration::from_secs(1));
+    }
+
+    #[test]
     fn test_run() {
         let mut sim = SimulationRuntime::new().unwrap();
         let handle = sim.handle();
@@ -578,6 +636,27 @@ mod tests {
         sim.run_until(Duration::from_millis(50)).unwrap();
         assert_eq!(count.load(AOrdering::SeqCst), 3);
         assert_eq!(sim.now(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_canceled_delay_does_not_advance_time() {
+        let mut sim = SimulationRuntime::new().unwrap();
+        let handle = sim.handle();
+        let short_won = Arc::new(AtomicBool::new(false));
+
+        let won = short_won.clone();
+        sim.loom().spawn_async(async move {
+            tokio::select! {
+                _ = handle.delay(Duration::from_secs(1)) => {}
+                _ = handle.delay(Duration::from_millis(10)) => {
+                    won.store(true, AOrdering::SeqCst);
+                }
+            }
+        });
+
+        let final_time = sim.run().unwrap();
+        assert!(short_won.load(AOrdering::SeqCst));
+        assert_eq!(final_time, Duration::from_millis(10));
     }
 
     #[test]

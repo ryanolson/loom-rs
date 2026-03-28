@@ -1,15 +1,29 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use super::time::SimTime;
 
 /// Type-erased closure executed at a scheduled virtual time.
 pub(crate) type Action = Box<dyn FnOnce() + Send>;
 
+/// Cancellation token for a scheduled action.
+pub(crate) struct CancelHandle {
+    canceled: Arc<AtomicBool>,
+}
+
+impl CancelHandle {
+    pub(crate) fn cancel(&self) {
+        self.canceled.store(true, AtomicOrdering::Release);
+    }
+}
+
 /// An action tagged with its scheduled time and insertion order.
 struct TimedAction {
     time: SimTime,
     seq: u64,
+    canceled: Arc<AtomicBool>,
     action: Action,
 }
 
@@ -53,14 +67,37 @@ impl EventQueue {
 
     /// Insert an action to be executed at the given virtual time.
     pub(crate) fn insert(&mut self, time: SimTime, action: Action) {
+        let _ = self.insert_cancellable(time, action);
+    }
+
+    /// Insert a cancelable action to be executed at the given virtual time.
+    pub(crate) fn insert_cancellable(&mut self, time: SimTime, action: Action) -> CancelHandle {
         let seq = self.seq_counter;
         self.seq_counter += 1;
+        let canceled = Arc::new(AtomicBool::new(false));
         self.heap
-            .push(std::cmp::Reverse(TimedAction { time, seq, action }));
+            .push(std::cmp::Reverse(TimedAction {
+                time,
+                seq,
+                canceled: canceled.clone(),
+                action,
+            }));
+        CancelHandle { canceled }
+    }
+
+    fn discard_canceled_head(&mut self) {
+        while self
+            .heap
+            .peek()
+            .is_some_and(|entry| entry.0.canceled.load(AtomicOrdering::Acquire))
+        {
+            self.heap.pop();
+        }
     }
 
     /// Peek at the earliest scheduled time without removing anything.
-    pub(crate) fn peek_time(&self) -> Option<SimTime> {
+    pub(crate) fn peek_time(&mut self) -> Option<SimTime> {
+        self.discard_canceled_head();
         self.heap.peek().map(|r| r.0.time)
     }
 
@@ -68,6 +105,7 @@ impl EventQueue {
     ///
     /// Returns `None` if the queue is empty or the next action is at a later time.
     pub(crate) fn pull_if_at(&mut self, at: SimTime) -> Option<Action> {
+        self.discard_canceled_head();
         if self.peek_time() == Some(at) {
             Some(self.heap.pop().unwrap().0.action)
         } else {
@@ -156,5 +194,18 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(q.peek_time(), None);
         assert!(q.pull_if_at(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn test_canceled_head_is_skipped() {
+        let mut q = EventQueue::new();
+
+        let canceled = q.insert_cancellable(Duration::from_secs(1), Box::new(|| {}));
+        q.insert(Duration::from_secs(2), Box::new(|| {}));
+        canceled.cancel();
+
+        assert_eq!(q.peek_time(), Some(Duration::from_secs(2)));
+        assert!(q.pull_if_at(Duration::from_secs(1)).is_none());
+        assert!(q.pull_if_at(Duration::from_secs(2)).is_some());
     }
 }
