@@ -45,6 +45,13 @@ pub enum LoomError {
         /// Number of actions processed before the guard triggered
         actions: usize,
     },
+
+    /// Simulation stalled: DES queue emptied before target task completed.
+    #[error("simulation stalled at {time:?}: task did not complete and no more events remain")]
+    SimStall {
+        /// The virtual time at which the stall was detected
+        time: std::time::Duration,
+    },
 }
 
 /// Result type alias for Loom operations.
